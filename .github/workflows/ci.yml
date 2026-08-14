@@ -70,8 +70,9 @@ jobs:
         shell: pwsh
         run: |
           subst X: "$env:GITHUB_WORKSPACE"
+          subst R: "X:\runtime"
           Set-Location X:\
-          pnpm tauri build --debug --bundles nsis
+          pnpm tauri build --debug --bundles nsis --config '{"bundle":{"resources":{"R:/current":"runtime","R:/current.json":"runtime/current.json"}}}'
       - name: Build Tauri application (macOS bundle)
         if: runner.os != 'Windows'
         run: pnpm tauri build --debug
