@@ -146,6 +146,21 @@ async function removeSourceMaps(root: string): Promise<void> {
   }
 }
 
+async function removeRuntimeTypeArtifacts(root: string): Promise<void> {
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const path = join(root, entry.name)
+    if (entry.isDirectory()) {
+      if (entry.name === 'dist-types') {
+        await rm(path, { recursive: true, force: true })
+      } else {
+        await removeRuntimeTypeArtifacts(path)
+      }
+    } else if (entry.name.endsWith('.d.ts')) {
+      await rm(path, { force: true })
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const output = resolve(argument('--output', join(projectRoot, 'runtime')))
   const upstreamSha = command('git', ['rev-parse', 'HEAD'], harnessRoot)
@@ -162,6 +177,7 @@ async function main(): Promise<void> {
   await materializeWorkspacePeers(join(runtimeRoot, 'dsh'))
   await linkVirtualStorePackages(join(runtimeRoot, 'dsh'))
   await removeSourceMaps(runtimeRoot)
+  await removeRuntimeTypeArtifacts(runtimeRoot)
   const nodeVersion = process.env.DSHPILOT_NODE_VERSION ?? '22.19.0'
   const nodeArchiveRoot = join(output, 'node-cache')
   await mkdir(nodeArchiveRoot, { recursive: true })
