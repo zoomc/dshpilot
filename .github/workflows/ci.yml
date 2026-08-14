@@ -67,7 +67,11 @@ jobs:
       - run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --target ${{ matrix.target }}
       - name: Build Tauri application (Windows NSIS)
         if: runner.os == 'Windows'
-        run: pnpm tauri build --debug --bundles nsis
+        shell: pwsh
+        run: |
+          subst X: "$env:GITHUB_WORKSPACE"
+          Set-Location X:\
+          pnpm tauri build --debug --bundles nsis
       - name: Build Tauri application (macOS bundle)
         if: runner.os != 'Windows'
         run: pnpm tauri build --debug
