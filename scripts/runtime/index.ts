@@ -19,7 +19,12 @@ interface PackageManifest {
 
 function command(name: string, args: string[], cwd: string): string {
   const executable = process.platform === 'win32' && name === 'pnpm' ? 'pnpm.cmd' : name
-  return execFileSync(executable, args, { cwd, encoding: 'utf8', env: { ...process.env, CI: process.env.CI ?? 'true' } }).trim()
+  return execFileSync(executable, args, {
+    cwd,
+    encoding: 'utf8',
+    env: { ...process.env, CI: process.env.CI ?? 'true' },
+    shell: process.platform === 'win32' && name === 'pnpm',
+  }).trim()
 }
 
 async function sha256(path: string): Promise<string> {
