@@ -150,7 +150,7 @@ async function removeRuntimeTypeArtifacts(root: string): Promise<void> {
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const path = join(root, entry.name)
     if (entry.isDirectory()) {
-      if (entry.name === 'dist-types') {
+      if (entry.name === 'dist-types' || entry.name === '.bin') {
         await rm(path, { recursive: true, force: true })
       } else {
         await removeRuntimeTypeArtifacts(path)
