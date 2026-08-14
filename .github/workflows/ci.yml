@@ -71,6 +71,7 @@ jobs:
         run: |
           subst X: "$env:GITHUB_WORKSPACE"
           Set-Location X:\
+          New-Item -ItemType Junction -Path X:\apps\desktop\src-tauri\runtime -Target X:\runtime | Out-Null
           @'
           {"bundle":{"resources":{"runtime/current":"runtime","runtime/current.json":"runtime/current.json"}}}
           '@ | Set-Content -Path X:\tauri.ci.windows.json -Encoding utf8
