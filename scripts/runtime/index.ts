@@ -135,6 +135,17 @@ async function linkVirtualStorePackages(deploymentRoot: string): Promise<void> {
   }
 }
 
+async function removeSourceMaps(root: string): Promise<void> {
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const path = join(root, entry.name)
+    if (entry.isDirectory()) {
+      await removeSourceMaps(path)
+    } else if (entry.name.endsWith('.map')) {
+      await rm(path, { force: true })
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const output = resolve(argument('--output', join(projectRoot, 'artifacts', 'runtime')))
   const upstreamSha = command('git', ['rev-parse', 'HEAD'], harnessRoot)
@@ -148,6 +159,7 @@ async function main(): Promise<void> {
   command('pnpm', ['deploy', '--legacy', '--filter', '@deepseek-ai/dsh', join(runtimeRoot, 'dsh')], harnessRoot)
   await materializeWorkspacePeers(join(runtimeRoot, 'dsh'))
   await linkVirtualStorePackages(join(runtimeRoot, 'dsh'))
+  await removeSourceMaps(runtimeRoot)
   const nodeVersion = process.env.DSHPILOT_NODE_VERSION ?? '22.19.0'
   const nodeArchiveRoot = join(output, 'node-cache')
   await mkdir(nodeArchiveRoot, { recursive: true })
