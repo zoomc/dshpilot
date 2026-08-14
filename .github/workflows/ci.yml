@@ -65,5 +65,10 @@ jobs:
       - run: pnpm run build:web
       - run: pnpm runtime:bundle -- --output artifacts/runtime
       - run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --target ${{ matrix.target }}
-      - run: pnpm tauri build --debug
+      - name: Build Tauri application (Windows NSIS)
+        if: runner.os == 'Windows'
+        run: pnpm tauri build --debug --bundles nsis
+      - name: Build Tauri application (macOS bundle)
+        if: runner.os != 'Windows'
+        run: pnpm tauri build --debug
       - run: pnpm smoke
