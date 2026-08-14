@@ -70,10 +70,9 @@ jobs:
         shell: pwsh
         run: |
           subst X: "$env:GITHUB_WORKSPACE"
-          subst R: "X:\runtime"
           Set-Location X:\
           @'
-          {"bundle":{"resources":{"R:\\current":"runtime","R:\\current.json":"runtime/current.json"}}}
+          {"bundle":{"resources":{"runtime/current":"runtime","runtime/current.json":"runtime/current.json"}}}
           '@ | Set-Content -Path X:\tauri.ci.windows.json -Encoding utf8
           pnpm tauri build --debug --bundles nsis --config X:\tauri.ci.windows.json
       - name: Build Tauri application (macOS bundle)
