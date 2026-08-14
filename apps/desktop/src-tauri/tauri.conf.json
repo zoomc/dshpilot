@@ -29,8 +29,8 @@
     "targets": "all",
     "icon": ["icons/icon.png", "icons/icon.ico"],
     "resources": {
-      "../../../artifacts/runtime/current": "runtime",
-      "../../../artifacts/runtime/current.json": "runtime/current.json"
+      "../../../runtime/current": "runtime",
+      "../../../runtime/current.json": "runtime/current.json"
     },
     "createUpdaterArtifacts": false
   }

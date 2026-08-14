@@ -63,7 +63,7 @@ jobs:
           CI: true
       - run: pnpm --dir vendor/deepseek-harness run build
       - run: pnpm run build:web
-      - run: pnpm runtime:bundle -- --output artifacts/runtime
+      - run: pnpm runtime:bundle -- --output runtime
       - run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --target ${{ matrix.target }}
       - name: Build Tauri application (Windows NSIS)
         if: runner.os == 'Windows'

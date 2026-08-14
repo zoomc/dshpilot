@@ -147,7 +147,7 @@ async function removeSourceMaps(root: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const output = resolve(argument('--output', join(projectRoot, 'artifacts', 'runtime')))
+  const output = resolve(argument('--output', join(projectRoot, 'runtime')))
   const upstreamSha = command('git', ['rev-parse', 'HEAD'], harnessRoot)
   const upstreamVersion = JSON.parse(await readFile(join(harnessRoot, 'apps/cli/package.json'), 'utf8')).version as string
   const runtimeVersion = `${upstreamVersion}-${upstreamSha.slice(0, 12)}-${process.platform}-${process.arch}`
