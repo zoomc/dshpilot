@@ -23,6 +23,10 @@ jobs:
           node-version: 22.19.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir vendor/deepseek-harness install --frozen-lockfile
+        env:
+          CI: true
+      - run: pnpm --dir vendor/deepseek-harness run build
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
