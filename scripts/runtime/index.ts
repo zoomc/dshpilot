@@ -18,7 +18,8 @@ interface PackageManifest {
 }
 
 function command(name: string, args: string[], cwd: string): string {
-  return execFileSync(name, args, { cwd, encoding: 'utf8', env: { ...process.env, CI: process.env.CI ?? 'true' } }).trim()
+  const executable = process.platform === 'win32' && name === 'pnpm' ? 'pnpm.cmd' : name
+  return execFileSync(executable, args, { cwd, encoding: 'utf8', env: { ...process.env, CI: process.env.CI ?? 'true' } }).trim()
 }
 
 async function sha256(path: string): Promise<string> {
@@ -48,7 +49,9 @@ async function downloadNode(nodeVersion: string, destination: string): Promise<s
   if (!expected || await sha256(archivePath) !== expected) throw new Error('Node runtime checksum mismatch')
   const extracted = join(destination, `node-v${nodeVersion}-${platform}-${arch}`)
   await rm(extracted, { recursive: true, force: true }); await mkdir(extracted, { recursive: true })
-  if (platform === 'win') execFileSync('unzip', ['-q', archivePath, '-d', destination])
+  // Windows runners provide bsdtar even when the optional unzip utility is absent.
+  // It can extract the Node zip archive and keeps the bundle script dependency-free.
+  if (platform === 'win') execFileSync('tar', ['-xf', archivePath, '-C', destination])
   else execFileSync('tar', ['-xzf', archivePath, '-C', destination])
   const nodePath = platform === 'win' ? join(extracted, 'node.exe') : join(extracted, 'bin', 'node')
   return nodePath
