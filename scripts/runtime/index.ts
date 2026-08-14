@@ -150,7 +150,9 @@ async function main(): Promise<void> {
   const output = resolve(argument('--output', join(projectRoot, 'runtime')))
   const upstreamSha = command('git', ['rev-parse', 'HEAD'], harnessRoot)
   const upstreamVersion = JSON.parse(await readFile(join(harnessRoot, 'apps/cli/package.json'), 'utf8')).version as string
-  const runtimeVersion = `${upstreamVersion}-${upstreamSha.slice(0, 12)}-${process.platform}-${process.arch}`
+  // Keep the on-disk/runtime-bundle identifier short enough for Windows NSIS.
+  // The full upstream version remains available in manifest.upstream.version.
+  const runtimeVersion = `${upstreamSha.slice(0, 12)}-${process.platform}-${process.arch}`
   const staging = join(output, 'staging', runtimeVersion)
   const runtimeRoot = join(staging, 'runtime')
   await rm(staging, { recursive: true, force: true })
