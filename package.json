@@ -1,0 +1,35 @@
+{
+  "name": "dshpilot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSHPilot — Desktop Workstation for DeepSeek Harness",
+  "license": "MIT",
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "build": "pnpm run build:packages && pnpm run build:web",
+    "build:packages": "pnpm --filter @dshpilot/desktop-host build && pnpm --filter @dshpilot/dsh-plugin-desktop build && pnpm --filter @dshpilot/dsh-client-desktop build",
+    "build:web": "vite build --config apps/desktop/vite.config.ts",
+    "dev:web": "vite --config apps/desktop/vite.config.ts",
+    "lint": "eslint . --ignore-pattern vendor --ignore-pattern node_modules",
+    "typecheck": "pnpm --filter @dshpilot/desktop-host typecheck && pnpm --filter @dshpilot/dsh-plugin-desktop typecheck && pnpm --filter @dshpilot/dsh-client-desktop typecheck && pnpm run typecheck:scripts",
+    "typecheck:scripts": "tsc -p tsconfig.scripts.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "tauri": "tauri",
+    "runtime:bundle": "tsx scripts/runtime/index.ts",
+    "guardian": "tsx scripts/guardian/index.ts",
+    "smoke": "tsx scripts/smoke/index.ts"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.5.0",
+    "@types/node": "^22.15.0",
+    "@vitejs/plugin-react": "^4.4.1",
+    "eslint": "^9.25.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.31.0",
+    "vite": "^6.3.2",
+    "vitest": "^3.1.1"
+  }
+}
