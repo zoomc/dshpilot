@@ -1,0 +1,23 @@
+{
+  "name": "@dshpilot/remote-daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "src/index.ts",
+  "bin": {
+    "dshpilot-remote": "lib/bin.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@dshpilot/control-contracts": "workspace:*",
+    "@dshpilot/desktop-host": "workspace:*",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
+  }
+}

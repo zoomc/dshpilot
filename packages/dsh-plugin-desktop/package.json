@@ -5,6 +5,11 @@
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
+  "dependencies": {
+    "@dshpilot/control-contracts": "workspace:*",
+    "@dshpilot/desktop-host": "workspace:*",
+    "@dshpilot/remote-daemon": "workspace:*"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"

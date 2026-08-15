@@ -35,7 +35,7 @@ DSHPilot 独立 Host/Client Plugin
 - [Qwen Code 研究](/Volumes/ExSSD/Projects/dshpilot/docs/research/qwen-code-architecture-review.md)
 - [Goose 研究](/Volumes/ExSSD/Projects/dshpilot/docs/research/goose-architecture-review.md)
 
-## 当前 DSHPilot 的真实状态
+## 当前 DSHPilot 的真实状态（实现快照）
 
 当前仓库已经具备：
 
@@ -50,18 +50,19 @@ DSHPilot 独立 Host/Client Plugin
 - Document content-addressed storage 和安全限制。
 - Native notification 基础命令。
 - Linux、macOS arm64、Windows x64 CI build/smoke。
+- Tauri Supervisor 的状态、健康检查、进程树退出、tray、single-instance、deep-link 和手动 retry。
+- signed immutable Runtime install/rollback，以及启动页上的独立 App/Runtime update 入口。
+- Phase 2 Host/Client plugin routes and UI、official MCP patch composition、token estimate、content-addressed document provider 和 native notification bridge。
+- Phase 3 typed control contracts、self-hosted daemon、官方 Harness `apiProxy` adapter、TLS/loopback guard、pairing、device scope、refresh rotation、SSE replay、PWA、artifact/Git/resource/lineage projections。
+- Phase 3 direct HTTP/SSE remote transport and authenticated opaque WebSocket relay transport；relay 只验证 bearer/device access 和握手签名，不读取业务密文。
+- Guardian 的 packaged Runtime boot、插件 loading、Web health 和失败后 workflow job failure propagation。
 
-但当前仍不能称为 Phase 1 complete 或 Phase 2 complete。最重要的缺口是：
+以下项目是 release/跨平台环境中的验收项，仍必须在对应 CI 或真实签名环境中完成：
 
-1. App Updater 尚未实现。
-2. Runtime update/rollback 尚未接入真实 Desktop 生命周期。
-3. Tauri 生产 Supervisor 尚未提供完整状态、健康检查和用户重试。
-4. Guardian 尚未做完整 packaged Desktop integration。
-5. MCP、Token、Documents 尚无实际 Client Plugin UI。
-6. Documents 尚无真正 parser/tool/subprocess 系统。
-7. Secret 尚未进入 OS Keychain/Harness Credentials。
-8. Native notification 尚未接入 Harness 业务事件。
-9. 尚无 self-hosted daemon、typed remote protocol 和 Remote PWA。
+1. 真实 release signing secrets 和 Windows/macOS 干净机器安装验收。
+2. PDF 专用 parser、Office 深度内容 parser 和恶意文档 fuzz/timeout 矩阵。
+3. OS Keychain/Harness Credentials 对所有第三方 secret provider 的真实端到端验收。
+4. 真实 Harness approval/question 交互、MCP server 和 provider fixture 的跨平台长时运行验收。
 
 ## 一、四个项目共同验证的架构结论
 

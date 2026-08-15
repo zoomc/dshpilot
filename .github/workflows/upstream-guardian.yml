@@ -42,9 +42,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh issue create \
-            --title "Upstream Guardian failure ($GITHUB_RUN_ID)" \
-            --body "The daily Harness compatibility guardian failed. See the workflow summary and guardian.log artifact."
+          title="Upstream Guardian failure"
+          body="The daily Harness compatibility guardian failed in run $GITHUB_RUN_ID. See the workflow summary and guardian.log artifact."
+          number="$(gh issue list --state open --search \"$title in:title\" --json number --jq '.[0].number')"
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --title "$title" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
       - name: Upload guardian log
         if: always()
         uses: actions/upload-artifact@v4
@@ -54,6 +59,9 @@ jobs:
             guardian.log
             artifacts/guardian
           if-no-files-found: ignore
+      - name: Fail guardian job when compatibility failed
+        if: steps.guardian.outcome == 'failure'
+        run: exit 1
       - name: Create candidate update PR
         if: steps.guardian.outcome == 'success'
         env:

@@ -31,6 +31,11 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+      - run: pnpm runtime:bundle -- --output runtime
+      - name: Select Linux packaged runtime for smoke
+        run: |
+          runtime_id="$(node -e "const fs=require('fs'); process.stdout.write(JSON.parse(fs.readFileSync('runtime/current.json','utf8')).runtimeVersion)")"
+          echo "DSHPILOT_RUNTIME_ROOT=$GITHUB_WORKSPACE/runtime/current/versions/$runtime_id" >> "$GITHUB_ENV"
       - run: pnpm smoke
 
   desktop:
@@ -62,8 +67,13 @@ jobs:
         env:
           CI: true
       - run: pnpm --dir vendor/deepseek-harness run build
-      - run: pnpm run build:web
+      - run: pnpm run build
       - run: pnpm runtime:bundle -- --output runtime
+      - name: Select packaged runtime for smoke
+        shell: bash
+        run: |
+          runtime_id="$(node -e "const fs=require('fs'); process.stdout.write(JSON.parse(fs.readFileSync('runtime/current.json','utf8')).runtimeVersion)")"
+          echo "DSHPILOT_RUNTIME_ROOT=$GITHUB_WORKSPACE/runtime/current/versions/$runtime_id" >> "$GITHUB_ENV"
       - run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --target ${{ matrix.target }}
       - name: Build Tauri application (Windows NSIS)
         if: runner.os == 'Windows'
@@ -74,5 +84,5 @@ jobs:
           pnpm tauri build --debug --bundles nsis --config apps/desktop/src-tauri/tauri.ci.windows.json
       - name: Build Tauri application (macOS bundle)
         if: runner.os != 'Windows'
-        run: pnpm tauri build --debug
+        run: pnpm tauri build --debug --config apps/desktop/src-tauri/tauri.ci.json
       - run: pnpm smoke

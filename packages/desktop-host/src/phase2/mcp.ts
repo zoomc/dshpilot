@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 
 export const MCP_PLUGIN_NAME = '@deepseek-ai/dsh-mcp-client'
@@ -212,7 +212,10 @@ async function atomicWrite(path: string, value: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
   const temporary = `${path}.${process.pid}.${Date.now()}.tmp`
   await writeFile(temporary, value, { encoding: 'utf8', mode: 0o600 })
-  await rename(temporary, path)
+  try { await rename(temporary, path) } catch (error) {
+    if (process.platform !== 'win32' || !['EEXIST', 'EPERM', 'EACCES'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error
+    await rm(path, { force: true }); await rename(temporary, path)
+  }
 }
 
 export class McpManager {

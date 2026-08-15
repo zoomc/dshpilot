@@ -1,6 +1,6 @@
 import { copyFile, cp, lstat, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { globSync } from 'node:fs'
-import { createHash, sign } from 'node:crypto'
+import { createHash, createPublicKey, sign } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -33,9 +33,22 @@ async function sha256(path: string): Promise<string> {
   return hash.digest('hex')
 }
 
+async function signingKey(value: string): Promise<Buffer> {
+  try { return await readFile(resolve(value)) } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    return Buffer.from(value)
+  }
+}
+
 function argument(name: string, fallback: string): string {
   const index = process.argv.indexOf(name)
   return index === -1 ? fallback : process.argv[index + 1] ?? fallback
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize)
+  if (typeof value !== 'object' || value === null) return value
+  return Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'manifestSignature').sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, canonicalize(entry)]))
 }
 
 async function downloadNode(nodeVersion: string, destination: string): Promise<string> {
@@ -190,6 +203,25 @@ async function removeRuntimeTypeArtifacts(root: string): Promise<void> {
   }
 }
 
+async function materializeDshpilotPlugins(deploymentRoot: string): Promise<void> {
+  const packages = ['control-contracts', 'desktop-host', 'dsh-plugin-desktop', 'dsh-client-desktop', 'remote-daemon']
+  for (const packageName of packages) {
+    const source = join(projectRoot, 'packages', packageName)
+    const manifestPath = join(source, 'package.json')
+    const libPath = join(source, 'lib')
+    await readFile(manifestPath)
+    await stat(libPath)
+    const destination = join(deploymentRoot, 'node_modules', '@dshpilot', packageName)
+    await mkdir(destination, { recursive: true })
+    await copyFile(manifestPath, join(destination, 'package.json'))
+    await cp(libPath, join(destination, 'lib'), { recursive: true })
+  }
+}
+
+async function writeDshpilotPatch(runtimeRoot: string): Promise<void> {
+  await writeFile(join(runtimeRoot, 'dshpilot.patch.yml'), `# DSHPilot integration layer; official Harness remains the business runtime.\n- insert:\n    - id: dshpilot-host\n      name: '@dshpilot/dsh-plugin-desktop'\n      inject: [webServer, apiProxy]\n    - id: dshpilot-client\n      name: '@dshpilot/dsh-client-desktop'\n`)
+}
+
 async function main(): Promise<void> {
   const output = resolve(argument('--output', join(projectRoot, 'runtime')))
   const upstreamSha = command('git', ['rev-parse', 'HEAD'], harnessRoot)
@@ -206,6 +238,8 @@ async function main(): Promise<void> {
   await materializeWorkspacePeers(join(runtimeRoot, 'dsh'))
   await linkVirtualStorePackages(join(runtimeRoot, 'dsh'))
   await flattenNodeModuleLinks(join(runtimeRoot, 'dsh'))
+  await materializeDshpilotPlugins(join(runtimeRoot, 'dsh'))
+  await writeDshpilotPatch(runtimeRoot)
   await removeSourceMaps(runtimeRoot)
   await removeRuntimeTypeArtifacts(runtimeRoot)
   const nodeVersion = process.env.DSHPILOT_NODE_VERSION ?? '22.19.0'
@@ -219,10 +253,11 @@ async function main(): Promise<void> {
   const artifactSize = (await stat(archive)).size
   const artifactSha256 = await sha256(archive)
   const privateKeyPath = process.env.DSHPILOT_RUNTIME_PRIVATE_KEY
-  const signature = privateKeyPath
-    ? sign(null, await readFile(archive), await readFile(privateKeyPath)).toString('base64')
+  const privateKey = privateKeyPath === undefined ? undefined : await signingKey(privateKeyPath)
+  const signature = privateKey
+    ? sign(null, await readFile(archive), privateKey).toString('base64')
     : 'UNSIGNED-LOCAL'
-  const manifest = {
+  const manifest: Record<string, unknown> = {
     schemaVersion: 1 as const,
     channel: 'tested' as const,
     runtimeVersion,
@@ -234,11 +269,22 @@ async function main(): Promise<void> {
     artifact: { url: `./${runtimeVersion}.tar.gz`, size: artifactSize, sha256: artifactSha256, signature },
     generatedAt: new Date().toISOString(),
   }
+  if (privateKey) manifest.manifestSignature = {
+    algorithm: 'Ed25519', keyId: process.env.DSHPILOT_RUNTIME_KEY_ID ?? 'default',
+    value: sign(null, Buffer.from(JSON.stringify(canonicalize(manifest))), privateKey).toString('base64'),
+  }
+  if (privateKey) {
+    const spki = createPublicKey(privateKey as Buffer).export({ format: 'der', type: 'spki' })
+    await writeFile(join(runtimeRoot, 'public.key'), Buffer.from(spki).subarray(-32).toString('base64') + '\n', { mode: 0o644 })
+  } else if (process.env.DSHPILOT_RUNTIME_PUBLIC_KEY_FILE !== undefined) {
+    await copyFile(resolve(process.env.DSHPILOT_RUNTIME_PUBLIC_KEY_FILE), join(runtimeRoot, 'public.key'))
+  }
   await writeFile(join(output, `${runtimeVersion}.json`), `${JSON.stringify(manifest, null, 2)}\n`)
   const currentRoot = join(output, 'current')
   await rm(currentRoot, { recursive: true, force: true }); await mkdir(currentRoot, { recursive: true })
   await cp(runtimeRoot, join(currentRoot, 'versions', runtimeVersion), { recursive: true })
   await writeFile(join(output, 'current.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+  try { await copyFile(join(runtimeRoot, 'public.key'), join(currentRoot, 'public.key')) } catch { /* unsigned local bundle */ }
   console.log(JSON.stringify({ archive, manifest: join(output, `${runtimeVersion}.json`), runtimeVersion }, null, 2))
 }
 

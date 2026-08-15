@@ -32,6 +32,14 @@
       "../../../runtime/current": "runtime",
       "../../../runtime/current.json": "runtime/current.json"
     },
-    "createUpdaterArtifacts": false
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgyRjFEMTVBQkFDNzM5MTAKUldRUU9jZTZXdEh4Z3FIQ09KcVJKVDRxeEwyVThrNjBEOEF1TU5adWVBa1VtWDdtQkZLZGREZkwK",
+      "endpoints": [
+        "https://github.com/zoomc/dshpilot/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

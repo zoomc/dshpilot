@@ -1,0 +1,94 @@
+name: Release Desktop
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            runtime_suffix: darwin-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            runtime_suffix: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir vendor/deepseek-harness install --frozen-lockfile
+        env:
+          CI: true
+      - run: pnpm --dir vendor/deepseek-harness run build
+      - run: pnpm run build
+      - run: pnpm run typecheck
+      - run: pnpm test
+      - run: pnpm run lint
+      - name: Validate release signing inputs
+        shell: bash
+        env:
+          RUNTIME_KEY: ${{ secrets.DSHPILOT_RUNTIME_PRIVATE_KEY }}
+          APP_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          APP_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          test -n "$RUNTIME_KEY" || { echo 'DSHPILOT_RUNTIME_PRIVATE_KEY is required'; exit 1; }
+          test -n "$APP_KEY" || { echo 'TAURI_SIGNING_PRIVATE_KEY is required'; exit 1; }
+          test -n "$APP_PASSWORD" || { echo 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD is required'; exit 1; }
+      - run: pnpm runtime:bundle -- --output runtime
+        env:
+          DSHPILOT_RUNTIME_PRIVATE_KEY: ${{ secrets.DSHPILOT_RUNTIME_PRIVATE_KEY }}
+          DSHPILOT_RUNTIME_KEY_ID: ${{ secrets.DSHPILOT_RUNTIME_KEY_ID }}
+      - name: Run packaged Runtime smoke
+        shell: bash
+        run: DSHPILOT_RUNTIME_ROOT="$PWD/runtime/current/versions/$(node -p "require('./runtime/current.json').runtimeVersion")" pnpm smoke
+      - name: Embed Runtime verification key
+        shell: bash
+        run: echo "DSHPILOT_RUNTIME_PUBLIC_KEY=$(cat runtime/current/public.key)" >> "$GITHUB_ENV"
+      - name: Generate release version overlay
+        shell: bash
+        run: node -e "require('fs').writeFileSync('apps/desktop/src-tauri/tauri.release.json', JSON.stringify({version: process.env.GITHUB_REF_NAME.replace(/^v/, '')}))"
+      - name: Build and publish signed Tauri release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: DSHPilot ${{ github.ref_name }}
+          releaseBody: Automated signed DSHPilot desktop release.
+          releaseDraft: false
+          prerelease: false
+          args: --target ${{ matrix.target }} --config apps/desktop/src-tauri/tauri.release.json
+      - name: Prepare platform Runtime manifest asset
+        shell: bash
+        run: cp "runtime/current.json" "runtime/current-${{ matrix.runtime_suffix }}.json"
+      - name: Upload tested Runtime assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            runtime/*.tar.gz
+            runtime/*-${{ matrix.runtime_suffix }}.json
+          draft: false
+          fail_on_unmatched_files: true

@@ -20,6 +20,13 @@ tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+keyring = "3"
+tauri-plugin-updater = "2"
+sha2 = "0.10"
+ed25519-dalek = "2"
+base64 = "0.22"
+libc = "0.2"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

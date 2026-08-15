@@ -1,14 +1,14 @@
-import { generateKeyPairSync, sign } from 'node:crypto'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { createHash, generateKeyPairSync, sign } from 'node:crypto'
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
-  RuntimePointers, SupervisorCore, isLoopbackUrl, parseReadinessUrl, resolveAppDataPaths,
-  sha256File, validateRuntimeManifest, verifyRuntimeArtifact,
+  RuntimePointers, SupervisorCore, isLoopbackUrl, parseReadinessUrl, resolveAppDataPaths, type RuntimeManifest,
+  downloadAndInstallRuntime, runtimeManifestSigningPayload, sha256File, validateRuntimeManifest, verifyRuntimeArtifact, verifyRuntimeManifestSignature,
 } from './index.js'
 
-function manifest(version: string) {
+function manifest(version: string): RuntimeManifest {
   return {
     schemaVersion: 1 as const, channel: 'tested' as const, runtimeVersion: version,
     upstream: { repository: 'https://github.com/deepseek-ai/deepseek-harness', ref: 'master', sha: 'a'.repeat(40), version: '0.1.0-rc.5' },
@@ -41,6 +41,16 @@ describe('runtime pointers', () => {
     expect((await pointers.rollback()).runtimeVersion).toBe('one')
     expect((await pointers.current())?.runtimeVersion).toBe('one')
   })
+
+  it('recovers an interrupted pointer transaction before reading', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-pointer-recovery-'))
+    const paths = resolveAppDataPaths(root)
+    const pointers = new RuntimePointers(paths)
+    await pointers.promote(manifest('healthy'))
+    await writeFile(join(paths.runtime, 'pointers.transaction.json'), JSON.stringify({ current: manifest('healthy') }))
+    await writeFile(paths.current, JSON.stringify(manifest('corrupt-intermediate')))
+    expect((await pointers.current())?.runtimeVersion).toBe('healthy')
+  })
 })
 
 describe('artifact verification', () => {
@@ -55,7 +65,29 @@ describe('artifact verification', () => {
     current.artifact.size = data.length
     current.artifact.sha256 = await sha256File(artifact)
     current.artifact.signature = signature
+    current.manifestSignature = { algorithm: 'Ed25519', keyId: 'test', value: sign(null, Buffer.from(runtimeManifestSigningPayload(current)), privateKey).toString('base64') }
+    verifyRuntimeManifestSignature(current, publicKey.export({ format: 'pem', type: 'spki' }).toString())
     await verifyRuntimeArtifact(artifact, current, publicKey.export({ format: 'pem', type: 'spki' }).toString())
+  })
+})
+
+describe('runtime update transaction', () => {
+  it('downloads, verifies, smoke-tests, promotes, and cleans staging', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-update-'))
+    const pointers = new RuntimePointers(resolveAppDataPaths(root))
+    const bytes = Buffer.from('runtime-archive')
+    const next = manifest('next')
+    next.artifact.size = bytes.length
+    next.artifact.sha256 = createHash('sha256').update(bytes).digest('hex')
+    next.artifact.signature = 'UNSIGNED-LOCAL'
+    await downloadAndInstallRuntime(next, pointers, {
+      publicKey: 'unused', allowUnsignedLocal: true,
+      fetchImpl: async () => new Response(bytes, { status: 200 }),
+      extract: async (_archive, staging) => { await mkdir(staging, { recursive: true }); await writeFile(join(staging, 'node'), 'fake-node') },
+      smoke: async staging => { await expect(readFile(join(staging, 'node'), 'utf8')).resolves.toBe('fake-node') },
+    })
+    expect((await pointers.current())?.runtimeVersion).toBe('next')
+    expect(await readdir(resolveAppDataPaths(root).staging)).toEqual([])
   })
 })
 

@@ -22,8 +22,12 @@ function classify(output: string, stage: string): FailureClass {
 }
 
 function run(name: string, command: string, args: readonly string[], cwd: string): string {
+  return runWithEnv(name, command, args, cwd, {})
+}
+
+function runWithEnv(name: string, command: string, args: readonly string[], cwd: string, extraEnv: Record<string, string>): string {
   try {
-    return execFileSync(command, args, { cwd, encoding: 'utf8', env: { ...process.env, CI: 'true' }, stdio: ['ignore', 'pipe', 'pipe'] })
+    return execFileSync(command, args, { cwd, encoding: 'utf8', env: { ...process.env, CI: 'true', ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'] })
   } catch (error) {
     const failure = error as { stdout?: string; stderr?: string; status?: number }
     const output = `${failure.stdout ?? ''}\n${failure.stderr ?? ''}`
@@ -47,6 +51,7 @@ async function main(): Promise<void> {
   const steps = [
     ['upstream-build', 'pnpm', ['run', 'typecheck'], harnessRoot],
     ['upstream-build', 'pnpm', ['run', 'build'], harnessRoot],
+    ['harness-config', 'pnpm', ['exec', 'dsh', '--dump-config'], harnessRoot],
     ['typecheck', 'pnpm', ['run', 'typecheck'], projectRoot],
     ['build', 'pnpm', ['run', 'build'], projectRoot],
     ['unit', 'pnpm', ['test'], projectRoot],
@@ -56,6 +61,9 @@ async function main(): Promise<void> {
   ] as const
   const diagnostics: string[] = []
   for (const [name, command, args, cwd] of steps) diagnostics.push(run(name, command, args, cwd))
+  const runtimeManifest = JSON.parse(await readFile(join(projectRoot, 'artifacts', 'guardian', 'runtime', 'current.json'), 'utf8')) as { runtimeVersion: string }
+  const packagedRoot = join(projectRoot, 'artifacts', 'guardian', 'runtime', 'current', 'versions', runtimeManifest.runtimeVersion)
+  diagnostics.push(runWithEnv('packaged-web-smoke', 'pnpm', ['smoke'], projectRoot, { DSHPILOT_RUNTIME_ROOT: packagedRoot }))
   const report = { status: 'PASS', stableSha: UPSTREAM_TESTED_SHA, candidateSha, generatedAt: new Date().toISOString(), diagnostics: diagnostics.join('\n') }
   const reportDir = join(projectRoot, 'artifacts', 'guardian')
   await mkdir(reportDir, { recursive: true })

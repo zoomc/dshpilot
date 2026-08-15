@@ -23,6 +23,7 @@ export const DEFAULT_NOTIFICATION_POLICY: Readonly<NotificationPolicy> = Object.
 })
 
 export function createDesktopNotification(kind: NotificationKind, title: string, body: string): DesktopNotification {
+  if (!['task-completed', 'task-failed', 'approval-needed', 'question-needed'].includes(kind)) throw new Error('unsupported notification kind')
   if (title.trim() === '') throw new Error('notification title is required')
   if (body.trim() === '') throw new Error('notification body is required')
   return { kind, title: title.trim().slice(0, 160), body: body.trim().slice(0, 4_000), createdAt: new Date().toISOString() }
