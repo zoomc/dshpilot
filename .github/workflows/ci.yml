@@ -82,7 +82,28 @@ jobs:
           subst X: "$env:GITHUB_WORKSPACE"
           Set-Location X:\
           pnpm tauri build --debug --bundles nsis --config apps/desktop/src-tauri/tauri.ci.windows.json
+          $installer = Get-ChildItem "apps/desktop/src-tauri/target/debug/bundle/nsis/*.exe" | Select-Object -First 1
+          if ($null -eq $installer) { throw 'NSIS installer was not produced' }
+          Start-Process $installer.FullName -ArgumentList '/S' -Wait
+          $binary = Get-ChildItem "$env:LOCALAPPDATA\DSHPilot" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in @('dshpilot-desktop.exe', 'DSHPilot.exe') } |
+            Select-Object -First 1
+          if ($null -eq $binary) { throw 'clean NSIS install did not produce an application binary' }
+          $process = Start-Process $binary.FullName -PassThru
+          Start-Sleep -Seconds 12
+          if ($process.HasExited) { throw 'installed DSHPilot exited before the packaged runtime smoke window' }
+          Stop-Process -Id $process.Id -Force
       - name: Build Tauri application (macOS bundle)
         if: runner.os != 'Windows'
         run: pnpm tauri build --debug --config apps/desktop/src-tauri/tauri.ci.json
+      - name: Launch clean macOS application bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app="$(find apps/desktop/src-tauri/target -path '*/bundle/macos/*.app' -print -quit)"
+          test -n "$app"
+          open "$app"
+          for attempt in $(seq 1 24); do pgrep -f 'dshpilot-desktop' >/dev/null && break; sleep 1; done
+          pgrep -f 'dshpilot-desktop' >/dev/null || { echo 'installed macOS bundle did not remain running'; exit 1; }
+          pkill -f 'dshpilot-desktop' || true
       - run: pnpm smoke

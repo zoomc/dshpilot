@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, extname, join, normalize, relative, resolve } from 'node:path'
 
 export type DocumentKind = 'pdf' | 'docx' | 'xlsx' | 'pptx' | 'csv' | 'txt' | 'md' | 'json' | 'yaml' | 'xml'
@@ -13,6 +13,7 @@ export interface DocumentLimits {
 
 export interface DocumentAttachmentManifest {
   attachmentId: string
+  provider: string
   name: string
   kind: DocumentKind
   mediaType: string
@@ -20,6 +21,10 @@ export interface DocumentAttachmentManifest {
   sha256: string
   createdAt: string
   macros: false
+  parser: string
+  parserVersion: 1
+  limits: Pick<DocumentLimits, 'maxBytes' | 'maxArchiveEntries' | 'maxExpandedBytes' | 'maxCompressionRatio'>
+  extractionStatus: 'pending'
 }
 
 export interface DocumentProvider {
@@ -50,6 +55,7 @@ const EXTENSIONS: Record<string, { kind: DocumentKind; mediaType: string }> = {
 }
 
 const ID_PATTERN = /^sha256:[a-f0-9]{64}$/u
+const KIND_SET = new Set<DocumentKind>(['pdf', 'docx', 'xlsx', 'pptx', 'csv', 'txt', 'md', 'json', 'yaml', 'xml'])
 
 function safeName(value: string): string {
   const leaf = basename(value.replaceAll('\\', '/')).replace(/[\u0000-\u001f\u007f]/gu, '').trim().slice(0, 255)
@@ -71,6 +77,24 @@ function metadataFor(path: string): { name: string; kind: DocumentKind; mediaTyp
   const metadata = EXTENSIONS[extname(name).toLowerCase()]
   if (metadata === undefined) throw new Error(`unsupported document type: ${extname(name) || '(none)'}`)
   return { name, ...metadata }
+}
+
+export function validateDocumentManifest(value: unknown): DocumentAttachmentManifest {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('document manifest must be an object')
+  const manifest = value as Partial<DocumentAttachmentManifest>
+  if (typeof manifest.attachmentId !== 'string' || !ID_PATTERN.test(manifest.attachmentId)) throw new Error('document attachment id is invalid')
+  if (typeof manifest.provider !== 'string' || !/^[A-Za-z0-9._-]{1,80}$/u.test(manifest.provider)) throw new Error('document provider is invalid')
+  if (typeof manifest.name !== 'string' || safeName(manifest.name) !== manifest.name) throw new Error('document manifest name is invalid')
+  if (typeof manifest.kind !== 'string' || !KIND_SET.has(manifest.kind)) throw new Error('document manifest kind is invalid')
+  if (typeof manifest.mediaType !== 'string' || manifest.mediaType.length === 0 || manifest.mediaType.length > 200) throw new Error('document manifest media type is invalid')
+  if (!Number.isSafeInteger(manifest.bytes) || (manifest.bytes as number) <= 0 || (manifest.bytes as number) > DEFAULT_DOCUMENT_LIMITS.maxBytes) throw new Error('document manifest byte count is invalid')
+  if (typeof manifest.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(manifest.sha256) || manifest.attachmentId !== `sha256:${manifest.sha256}`) throw new Error('document manifest checksum is invalid')
+  if (manifest.macros !== false || typeof manifest.parser !== 'string' || manifest.parser.length === 0 || manifest.parserVersion !== 1 || manifest.extractionStatus !== 'pending') throw new Error('document manifest metadata is invalid')
+  const limits = manifest.limits
+  if (typeof limits !== 'object' || limits === null || !Number.isSafeInteger(limits.maxBytes) || !Number.isSafeInteger(limits.maxArchiveEntries) || !Number.isSafeInteger(limits.maxExpandedBytes) || !Number.isSafeInteger(limits.maxCompressionRatio)
+    || limits.maxBytes <= 0 || limits.maxBytes > DEFAULT_DOCUMENT_LIMITS.maxBytes || limits.maxArchiveEntries < 1 || limits.maxArchiveEntries > 10_000 || limits.maxExpandedBytes < 1 || limits.maxExpandedBytes > 500 * 1024 * 1024 || limits.maxCompressionRatio < 1 || limits.maxCompressionRatio > 1_000) throw new Error('document manifest limits are invalid')
+  if (typeof manifest.createdAt !== 'string' || Number.isNaN(Date.parse(manifest.createdAt))) throw new Error('document manifest timestamp is invalid')
+  return manifest as DocumentAttachmentManifest
 }
 
 function uint32(data: Uint8Array, offset: number): number {
@@ -95,13 +119,14 @@ export function inspectOfficeArchive(data: Uint8Array, limits: DocumentLimits = 
   const entries = uint16(data, eocd + 10)
   const directorySize = uint32(data, eocd + 12)
   const directoryOffset = uint32(data, eocd + 16)
-  if (entries > limits.maxArchiveEntries || directoryOffset + directorySize > data.byteLength) throw new Error('Office document archive exceeds safety limits')
+  if (entries === 0xffff || directorySize === 0xffffffff || directoryOffset === 0xffffffff || entries > limits.maxArchiveEntries || directoryOffset + directorySize > data.byteLength) throw new Error('Office document archive exceeds safety limits (ZIP64 is not supported)')
   let offset = directoryOffset
   let expandedBytes = 0
   let hasMacros = false
   const decoder = new TextDecoder()
   for (let index = 0; index < entries; index += 1) {
     if (uint32(data, offset) !== 0x02014b50) throw new Error('Office document archive has an invalid directory entry')
+    const flags = uint16(data, offset + 8)
     const compressed = uint32(data, offset + 20)
     const expanded = uint32(data, offset + 24)
     const nameLength = uint16(data, offset + 28)
@@ -110,8 +135,9 @@ export function inspectOfficeArchive(data: Uint8Array, limits: DocumentLimits = 
     const name = decoder.decode(data.slice(offset + 46, offset + 46 + nameLength))
     assertSafeRelativePath(name)
     if (name.toLowerCase().includes('vbaproject.bin') || name.toLowerCase().endsWith('.xlsm')) hasMacros = true
+    if ((flags & 0x1) !== 0 || compressed === 0xffffffff || expanded === 0xffffffff) throw new Error('encrypted or ZIP64 Office archives are not supported')
     expandedBytes += expanded
-    if (expandedBytes > limits.maxExpandedBytes || (compressed > 0 && expanded / compressed > limits.maxCompressionRatio)) throw new Error('Office document archive exceeds decompression limits')
+    if (expanded > limits.maxExpandedBytes || expandedBytes > limits.maxExpandedBytes || (compressed > 0 && expanded / compressed > limits.maxCompressionRatio)) throw new Error('Office document archive exceeds decompression limits')
     offset += 46 + nameLength + extraLength + commentLength
   }
   if (hasMacros) throw new Error('Office macros are not allowed in document attachments')
@@ -159,11 +185,12 @@ export class LocalDocumentProvider implements DocumentProvider {
   }
 
   async addFile(path: string): Promise<DocumentAttachmentManifest> {
-    const info = await lstat(path)
+    const safePath = await realpath(path)
+    const info = await lstat(safePath)
     if (!info.isFile()) throw new Error('document attachment must be a regular file')
     if (info.size > this.limits.maxBytes) throw new Error('document exceeds the configured byte limit')
-    const metadata = metadataFor(path)
-    const data = new Uint8Array(await readFile(path))
+    const metadata = metadataFor(safePath)
+    const data = new Uint8Array(await readFile(safePath))
     validateBytes(data, metadata, this.limits)
     return this.addBytes(data, metadata.name, metadata.kind, metadata.mediaType)
   }
@@ -173,8 +200,9 @@ export class LocalDocumentProvider implements DocumentProvider {
     validateBytes(data, metadata, this.limits)
     const sha256 = digest(data)
     const manifest: DocumentAttachmentManifest = {
-      attachmentId: `sha256:${sha256}`, name: metadata.name, kind: metadata.kind, mediaType: metadata.mediaType,
+      attachmentId: `sha256:${sha256}`, provider: this.name, name: metadata.name, kind: metadata.kind, mediaType: metadata.mediaType,
       bytes: data.byteLength, sha256, createdAt: new Date().toISOString(), macros: false,
+      parser: `dshpilot-builtin-${metadata.kind}`, parserVersion: 1, limits: { maxBytes: this.limits.maxBytes, maxArchiveEntries: this.limits.maxArchiveEntries, maxExpandedBytes: this.limits.maxExpandedBytes, maxCompressionRatio: this.limits.maxCompressionRatio }, extractionStatus: 'pending',
     }
     await persist(this.root, data, manifest)
     return manifest

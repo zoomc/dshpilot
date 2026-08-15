@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path'
 export const MCP_PLUGIN_NAME = '@deepseek-ai/dsh-mcp-client'
 export type McpTransport = 'stdio' | 'streamable-http'
 export type McpRecordStatus = 'configured' | 'disabled' | 'connecting' | 'ready' | 'reconnecting' | 'failed'
+export interface McpReconnectPolicy { enabled: boolean; initialDelayMs: number; maxDelayMs: number; maxAttempts: number }
 
 export interface McpServerRecord {
   id: string
@@ -24,7 +25,23 @@ export interface McpServerRecord {
   lastError?: string
   toolCallTimeoutMs?: number
   failOnStartupError?: boolean
+  reconnect?: McpReconnectPolicy
   updatedAt: string
+}
+
+/** Exact configuration shape consumed by the official @deepseek-ai/dsh-mcp-client plugin. */
+export interface OfficialMcpPluginConfig {
+  serverName: string
+  transport: McpTransport
+  command?: string
+  args: string[]
+  cwd?: string
+  url?: string
+  env: Record<string, string>
+  headers: Record<string, string>
+  toolCallTimeoutMs?: number
+  failOnStartupError?: boolean
+  reconnect?: McpReconnectPolicy
 }
 
 export interface McpDiff {
@@ -51,6 +68,7 @@ const SERVER_NAME = /^[A-Za-z0-9_-]{1,32}$/u
 const ID_NAME = /^[A-Za-z0-9._-]{1,80}$/u
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u
 const SECRET_KEY = /(token|secret|password|api[-_]?key|authorization|credential)/iu
+const DEFAULT_RECONNECT: McpReconnectPolicy = Object.freeze({ enabled: true, initialDelayMs: 500, maxDelayMs: 30_000, maxAttempts: 10 })
 
 function object(value: unknown): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
@@ -118,8 +136,22 @@ function toRecord(idHint: string, raw: unknown, warnings: string[]): McpServerRe
     headerRefs: secretHeaders.refs,
     ...(Number.isSafeInteger(input.toolCallTimeoutMs) ? { toolCallTimeoutMs: input.toolCallTimeoutMs as number } : {}),
     ...(typeof input.failOnStartupError === 'boolean' ? { failOnStartupError: input.failOnStartupError } : {}),
+    ...(input.reconnect !== undefined ? { reconnect: normalizeReconnect(input.reconnect, warnings) } : {}),
     updatedAt: new Date().toISOString(),
   }
+}
+
+function normalizeReconnect(value: unknown, warnings: string[] = []): McpReconnectPolicy {
+  const input = object(value); const result = { ...DEFAULT_RECONNECT }
+  for (const key of ['enabled', 'initialDelayMs', 'maxDelayMs', 'maxAttempts'] as const) {
+    const raw = input[key]
+    if (key === 'enabled') { if (raw !== undefined && typeof raw !== 'boolean') warnings.push(`reconnect.${key}: invalid value ignored`); else if (typeof raw === 'boolean') result[key] = raw }
+    else if (raw !== undefined && (!Number.isSafeInteger(raw) || (raw as number) < 1)) warnings.push(`reconnect.${key}: invalid value ignored`)
+    else if (typeof raw === 'number') result[key] = raw
+  }
+  if (result.initialDelayMs > result.maxDelayMs) throw new Error('MCP reconnect initialDelayMs cannot exceed maxDelayMs')
+  if (result.maxAttempts > 100) throw new Error('MCP reconnect maxAttempts is too large')
+  return result
 }
 
 function comparable(record: McpServerRecord): string {
@@ -134,7 +166,21 @@ export function validateMcpServer(record: McpServerRecord): McpServerRecord {
   if (record.transport === 'streamable-http' && (!record.url || record.command !== undefined)) throw new Error(`${record.id}: invalid HTTP config`)
   if (!Array.isArray(record.args) || record.args.some(item => typeof item !== 'string')) throw new Error(`${record.id}: args must be strings`)
   for (const key of Object.keys(record.envRefs)) if (!ENV_NAME.test(record.envRefs[key] ?? '')) throw new Error(`${record.id}: invalid environment reference`)
-  return record
+  const env = { ...record.env }; const headers = { ...record.headers }
+  for (const key of Object.keys(env)) if (SECRET_KEY.test(key)) delete env[key]
+  for (const key of Object.keys(headers)) if (SECRET_KEY.test(key) || key.toLowerCase() === 'authorization') delete headers[key]
+  if (record.reconnect !== undefined) normalizeReconnect(record.reconnect)
+  return { ...record, env, headers }
+}
+
+export function officialMcpPluginConfig(record: McpServerRecord): OfficialMcpPluginConfig {
+  const safe = validateMcpServer(record)
+  return {
+    serverName: safe.serverName, transport: safe.transport, args: [...safe.args], env: { ...safe.env }, headers: { ...safe.headers },
+    ...(safe.command === undefined ? {} : { command: safe.command }), ...(safe.cwd === undefined ? {} : { cwd: safe.cwd }), ...(safe.url === undefined ? {} : { url: safe.url }),
+    ...(safe.toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs: safe.toolCallTimeoutMs }), ...(safe.failOnStartupError === undefined ? {} : { failOnStartupError: safe.failOnStartupError }),
+    reconnect: safe.reconnect ?? DEFAULT_RECONNECT,
+  }
 }
 
 export function diffMcpServers(existing: readonly McpServerRecord[], incoming: readonly McpServerRecord[]): McpDiff {
@@ -185,6 +231,7 @@ function renderMap(entries: Record<string, string>, refs: Record<string, string>
 }
 
 export function renderMcpPatch(records: readonly McpServerRecord[]): string {
+  records = records.map(validateMcpServer)
   const lines = ['# Generated by DSHPilot. Secrets are environment references only.', '']
   for (const record of records) {
     lines.push('- insert:', `    - id: ${yamlString(record.id)}`, `      name: ${yamlString(MCP_PLUGIN_NAME)}`, `      disabled: ${String(!record.enabled)}`, '      config:', `        serverName: ${yamlString(record.serverName)}`, `        transport: ${yamlString(record.transport)}`)
@@ -203,6 +250,8 @@ export function renderMcpPatch(records: readonly McpServerRecord[]): string {
     }
     if (record.toolCallTimeoutMs !== undefined) lines.push(`        toolCallTimeoutMs: ${record.toolCallTimeoutMs}`)
     if (record.failOnStartupError !== undefined) lines.push(`        failOnStartupError: ${String(record.failOnStartupError)}`)
+    const reconnect = record.reconnect ?? DEFAULT_RECONNECT
+    lines.push('        reconnect:', `          enabled: ${String(reconnect.enabled)}`, `          initialDelayMs: ${reconnect.initialDelayMs}`, `          maxDelayMs: ${reconnect.maxDelayMs}`, `          maxAttempts: ${reconnect.maxAttempts}`)
     lines.push('')
   }
   return `${lines.join('\n').trimEnd()}\n`

@@ -251,6 +251,7 @@ export interface ControlPlaneAdapter {
   interrupt?: (sessionId: string) => Promise<void>
   permissions?: (sessionId?: string) => Promise<PermissionSummary[]>
   permissionReply?: (permissionId: string, decision: 'allow' | 'deny') => Promise<void>
+  questionReply?: (rpcId: string, sessionId: string, answers: Array<{ id: string; selected: string[]; custom?: string }>) => Promise<void>
   artifacts?: () => Promise<unknown[]>
   artifactRead?: (artifactId: string) => Promise<Uint8Array>
   git?: (cwd: string, path?: string) => Promise<unknown>
@@ -288,6 +289,7 @@ export class ControlPlaneServer {
   private readonly options: Required<Pick<ControlPlaneServerOptions, 'version' | 'host' | 'port' | 'remoteEnabled'>> & ControlPlaneServerOptions
   private addressValue?: { host: string; port: number }
   private readonly admittedRequests = new Map<string, string>()
+  private readonly inflightAdmissions = new Map<string, Promise<{ taskId: string }>>()
   private pairingAttempts = { windowStartedAt: Date.now(), count: 0 }
   private readonly requestWindows = new Map<string, { windowStartedAt: number; count: number }>()
   private activeSseConnections = 0
@@ -358,7 +360,7 @@ export class ControlPlaneServer {
   }
 
   private async control(request: IncomingMessage, value: ControlRequest): Promise<ControlResponse> {
-    const scope: ControlScope = value.kind === 'device_list' || value.kind === 'device_revoke' || value.kind === 'device_rotate' ? 'admin' : value.kind === 'prompt_admission' || value.kind === 'interrupt' || value.kind === 'permission_reply' ? 'control' : 'read'
+    const scope: ControlScope = value.kind === 'device_list' || value.kind === 'device_revoke' || value.kind === 'device_rotate' ? 'admin' : value.kind === 'prompt_admission' || value.kind === 'interrupt' || value.kind === 'permission_reply' || value.kind === 'question_reply' ? 'control' : 'read'
     this.authorize(request, scope)
     if (value.kind === 'events') return { ok: true, value: this.events.list(value.after, value.limit) }
     if (value.kind === 'server_info') return { ok: true, value: this.serverInfo() }
@@ -369,13 +371,35 @@ export class ControlPlaneServer {
     if (value.kind === 'prompt_admission') {
       const admitted = this.admittedRequests.get(value.requestId)
       if (admitted !== undefined) return { ok: true, requestId: value.requestId, value: { taskId: admitted, deduplicated: true } }
+      const inflight = this.inflightAdmissions.get(value.requestId)
+      if (inflight !== undefined) {
+        const result = await inflight
+        return { ok: true, requestId: value.requestId, value: { ...result, deduplicated: true } }
+      }
       if (this.options.adapter?.admitPrompt === undefined) return { ok: false, requestId: value.requestId, error: { code: 'NOT_CONFIGURED', message: 'prompt admission adapter is not configured' } }
-      const result = await this.options.adapter.admitPrompt(value); this.admittedRequests.set(value.requestId, result.taskId); this.events.append('prompt.accepted', { requestId: value.requestId, taskId: result.taskId }); return { ok: true, requestId: value.requestId, value: result }
+      const admission = this.options.adapter.admitPrompt(value).then(result => {
+        this.admittedRequests.set(value.requestId, result.taskId)
+        this.events.append('prompt.accepted', { requestId: value.requestId, taskId: result.taskId })
+        return result
+      })
+      this.inflightAdmissions.set(value.requestId, admission)
+      try {
+        return { ok: true, requestId: value.requestId, value: await admission }
+      } finally {
+        if (this.inflightAdmissions.get(value.requestId) === admission) this.inflightAdmissions.delete(value.requestId)
+      }
     }
-    if (value.kind === 'interrupt') { await this.options.adapter?.interrupt?.(value.sessionId); return { ok: true, requestId: value.requestId, value: { interrupted: true } } }
+    if (value.kind === 'interrupt') {
+      if (this.options.adapter?.interrupt === undefined) return { ok: false, requestId: value.requestId, error: { code: 'NOT_CONFIGURED', message: 'interrupt adapter is not configured' } }
+      await this.options.adapter.interrupt(value.sessionId); return { ok: true, requestId: value.requestId, value: { interrupted: true } }
+    }
     if (value.kind === 'permission_reply') {
       if (this.options.adapter?.permissionReply === undefined) return { ok: false, requestId: value.requestId, error: { code: 'NOT_CONFIGURED', message: 'permission adapter is not configured' } }
       await this.options.adapter.permissionReply(value.permissionId, value.decision); this.events.append('permission.resolved', { permissionId: value.permissionId, decision: value.decision }); return { ok: true, requestId: value.requestId, value: { resolved: true } }
+    }
+    if (value.kind === 'question_reply') {
+      if (this.options.adapter?.questionReply === undefined) return { ok: false, requestId: value.requestId, error: { code: 'NOT_CONFIGURED', message: 'question adapter is not configured' } }
+      await this.options.adapter.questionReply(value.rpcId, value.sessionId, value.answers); this.events.append('task.updated', { sessionId: value.sessionId, waitingFor: 'user-question-resolved' }); return { ok: true, requestId: value.requestId, value: { resolved: true } }
     }
     if (value.kind === 'device_list') return { ok: true, value: this.devices.list() }
     if (value.kind === 'device_revoke') { const device = await this.devices.revoke(value.deviceId); this.events.append('device.revoked', { deviceId: device.deviceId }); return { ok: true, value: device } }
@@ -384,7 +408,7 @@ export class ControlPlaneServer {
   }
 
   private serverInfo(): ServerInfo {
-    const capabilities = ['events', 'sessions', 'tasks', 'runtime', 'pairing', 'restricted-control', 'permissions', 'refresh-token']
+    const capabilities = ['events', 'sessions', 'tasks', 'runtime', 'pairing', 'restricted-control', 'permissions', 'questions', 'steer', 'refresh-token']
     if (this.options.adapter?.artifacts !== undefined) capabilities.push('artifacts')
     if (this.options.adapter?.git !== undefined) capabilities.push('git')
     if (this.options.adapter?.resources !== undefined) capabilities.push('resources')
@@ -415,15 +439,23 @@ export class ControlPlaneServer {
   private async sse(request: IncomingMessage, response: ServerResponse, after: number, generation?: string): Promise<void> {
     if (this.activeSseConnections >= (this.options.maxSseConnections ?? 8)) throw new RateLimitError('too many event streams')
     this.activeSseConnections += 1
+    let unsubscribe: (() => void) | undefined
     try {
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-content-type-options': 'nosniff' })
+      let streaming = false
+      const buffered: ControlEvent[] = []
+      unsubscribe = this.events.subscribe(event => {
+        if (!streaming) { buffered.push(event); return }
+        if (!response.destroyed) response.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`)
+      })
       const page = this.events.page(after, 500, generation)
       if (page.resetRequired) response.write(`event: reset-required\ndata: ${JSON.stringify({ generation: page.generation, oldestSeq: page.oldestSeq })}\n\n`)
       for (const event of page.events) response.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`)
-      const unsubscribe = this.events.subscribe(event => { if (!response.destroyed) response.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`) })
+      streaming = true
+      for (const event of buffered) if (event.seq > page.latestSeq && !response.destroyed) response.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`)
       const heartbeat = setInterval(() => { if (!response.destroyed) response.write(': heartbeat\n\n') }, 15_000)
-      await new Promise<void>(resolveClose => request.on('close', () => { clearInterval(heartbeat); unsubscribe(); resolveClose() }))
-    } finally { this.activeSseConnections -= 1 }
+      await new Promise<void>(resolveClose => request.on('close', () => { clearInterval(heartbeat); unsubscribe?.(); unsubscribe = undefined; resolveClose() }))
+    } finally { unsubscribe?.(); this.activeSseConnections -= 1 }
   }
 
   private async handleRelayUpgrade(request: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer): Promise<void> {
@@ -454,7 +486,9 @@ export class ControlPlaneServer {
           ws.send(JSON.stringify({ type: 'ready', version: 1, sessionId }))
           return
         }
-        if (value.sessionId !== sessionId || typeof value.direction !== 'string' || typeof value.frameSeq !== 'number') throw new Error('relay frame metadata is invalid')
+        if (value.sessionId !== sessionId || value.version !== 1 || (value.direction !== 'client_to_server' && value.direction !== 'server_to_client') || !Number.isSafeInteger(value.frameSeq)
+          || typeof value.nonce !== 'string' || typeof value.iv !== 'string' || typeof value.tag !== 'string' || typeof value.ciphertext !== 'string'
+          || (value.aad !== undefined && typeof value.aad !== 'string')) throw new Error('relay encrypted frame envelope is invalid')
         this.relayRouter.forward(sessionId, connectionId, bytes)
       } catch { ws.close(1008, 'invalid relay frame') }
     })

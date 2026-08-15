@@ -43,19 +43,21 @@ async function main(): Promise<void> {
   args.push('--host', '127.0.0.1', '--port', '0')
   const child = spawn(program, args, {
     cwd: runtimeRoot ? join(runtimeRoot, 'dsh') : harnessRoot,
-    env: { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', DSHPILOT_REMOTE_CONTROL: '1', DSHPILOT_REMOTE_PRINT_PAIRING: '1' },
+    env: { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', DSHPILOT_REMOTE_CONTROL: '1', DSHPILOT_REMOTE_PRINT_PAIRING: '1', DSHPILOT_REMOTE_ALLOW_LOCAL_PAIRING: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   const output: string[] = []
   let url: string | undefined
   let remotePort: number | undefined
+  let pairingCode: string | undefined
   const consume = (stream: NodeJS.ReadableStream): void => {
     const lines = createInterface({ input: stream })
     lines.on('line', line => {
       output.push(line); url ??= readinessUrl(line)
       try {
-        const value = JSON.parse(line) as { dshpilotRemote?: string; port?: number }
+        const value = JSON.parse(line) as { dshpilotRemote?: string; port?: number; dshpilotPairingOffer?: { code?: unknown } }
         if (value.dshpilotRemote === 'ready' && Number.isSafeInteger(value.port)) remotePort = value.port
+        if (typeof value.dshpilotPairingOffer === 'object' && value.dshpilotPairingOffer !== null && typeof (value.dshpilotPairingOffer as { code?: unknown }).code === 'string') pairingCode = (value.dshpilotPairingOffer as { code: string }).code
       } catch { /* ordinary Harness output */ }
     })
   }
@@ -77,17 +79,29 @@ async function main(): Promise<void> {
   if (!response.ok) throw new Error(`Harness readiness URL returned HTTP ${response.status}`)
   const html = await response.text()
   if (!html.includes('<!doctype html>')) throw new Error('Harness Web UI did not return HTML')
+  let hostPluginLoaded = false
   if (runtimeRoot) {
     const health = await fetch(`${url}/__dshpilot/health`)
     if (!health.ok || (await health.json() as { status?: string }).status !== 'ready') throw new Error('Packaged DSHPilot Host Plugin health check failed')
+    const status = await fetch(`${url}/__dshpilot/plugin-status`)
+    const pluginStatus = await status.json() as { hostPlugin?: boolean; officialServices?: { webServer?: boolean; apiProxy?: boolean; tools?: boolean }; documentTools?: string[] }
+    hostPluginLoaded = status.ok && pluginStatus.hostPlugin === true && pluginStatus.officialServices?.tools === true && pluginStatus.documentTools?.length === 6
+    if (!hostPluginLoaded) throw new Error('Packaged DSHPilot Host Plugin registration check failed')
     if (remotePort === undefined) throw new Error('Packaged DSHPilot remote control did not announce readiness')
     const remoteHealth = await fetch(`http://127.0.0.1:${String(remotePort)}/health`)
     if (!remoteHealth.ok || (await remoteHealth.json() as { ok?: boolean }).ok !== true) throw new Error('Packaged DSHPilot remote control health check failed')
+    if (pairingCode === undefined) throw new Error('Packaged DSHPilot remote control did not announce a pairing offer')
+    const paired = await fetch(`http://127.0.0.1:${String(remotePort)}/v1/pair`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: pairingCode, name: 'packaged-smoke' }) })
+    const pairedValue = await paired.json() as { ok?: boolean; value?: { token?: string; device?: { deviceId?: string } } }
+    if (!paired.ok || pairedValue.ok !== true || pairedValue.value?.token === undefined) throw new Error('Packaged DSHPilot remote pairing failed')
+    const serverInfo = await fetch(`http://127.0.0.1:${String(remotePort)}/v1/server`, { headers: { authorization: `Bearer ${pairedValue.value.token}` } })
+    const serverValue = await serverInfo.json() as { ok?: boolean; value?: { capabilities?: string[] } }
+    if (!serverInfo.ok || serverValue.ok !== true || !serverValue.value?.capabilities?.includes('restricted-control')) throw new Error('Packaged DSHPilot remote authenticated API check failed')
   }
   child.kill('SIGTERM')
   await new Promise<void>(resolveExit => child.once('exit', () => resolveExit()))
   await rm(home, { recursive: true, force: true })
-  console.log(JSON.stringify({ ok: true, url, bytes: html.length, pluginLoading: true }))
+  console.log(JSON.stringify({ ok: true, url, bytes: html.length, hostPluginLoaded, clientPlugin: clientPlugin.name === 'dshpilot-client' }))
 }
 
 void main().catch(error => { console.error(error); process.exitCode = 1 })

@@ -89,6 +89,17 @@ describe('runtime update transaction', () => {
     expect((await pointers.current())?.runtimeVersion).toBe('next')
     expect(await readdir(resolveAppDataPaths(root).staging)).toEqual([])
   })
+
+  it('does not promote a checksum failure or interrupted download', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-update-failure-')); const paths = resolveAppDataPaths(root); const pointers = new RuntimePointers(paths); await pointers.promote(manifest('stable'))
+    const bytes = Buffer.from('runtime-archive'); const bad = manifest('bad'); bad.artifact.size = bytes.length; bad.artifact.sha256 = 'f'.repeat(64); bad.artifact.signature = 'UNSIGNED-LOCAL'
+    await expect(downloadAndInstallRuntime(bad, pointers, { publicKey: 'unused', allowUnsignedLocal: true, fetchImpl: async () => new Response(bytes), extract: async () => undefined, smoke: async () => undefined })).rejects.toThrow('checksum')
+    expect((await pointers.current())?.runtimeVersion).toBe('stable')
+    const interrupted = manifest('interrupted'); interrupted.artifact.size = bytes.length; interrupted.artifact.sha256 = createHash('sha256').update(bytes).digest('hex'); interrupted.artifact.signature = 'UNSIGNED-LOCAL'
+    const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes.subarray(0, 3)); controller.error(new Error('network interrupted')) } })
+    await expect(downloadAndInstallRuntime(interrupted, pointers, { publicKey: 'unused', allowUnsignedLocal: true, fetchImpl: async () => new Response(stream), extract: async () => undefined, smoke: async () => undefined })).rejects.toThrow('network interrupted')
+    expect((await pointers.current())?.runtimeVersion).toBe('stable')
+  })
 })
 
 describe('supervisor state machine', () => {

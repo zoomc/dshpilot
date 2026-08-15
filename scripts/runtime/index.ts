@@ -219,7 +219,7 @@ async function materializeDshpilotPlugins(deploymentRoot: string): Promise<void>
 }
 
 async function writeDshpilotPatch(runtimeRoot: string): Promise<void> {
-  await writeFile(join(runtimeRoot, 'dshpilot.patch.yml'), `# DSHPilot integration layer; official Harness remains the business runtime.\n- insert:\n    - id: dshpilot-host\n      name: '@dshpilot/dsh-plugin-desktop'\n      inject: [webServer, apiProxy]\n    - id: dshpilot-client\n      name: '@dshpilot/dsh-client-desktop'\n`)
+  await writeFile(join(runtimeRoot, 'dshpilot.patch.yml'), `# DSHPilot integration layer; official Harness remains the business runtime.\n- insert:\n    - id: dshpilot-host\n      name: '@dshpilot/dsh-plugin-desktop'\n      inject: [webServer, apiProxy, tools, loader]\n    - id: dshpilot-client\n      name: '@dshpilot/dsh-client-desktop'\n`)
 }
 
 async function main(): Promise<void> {

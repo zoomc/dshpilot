@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
-import { useEffect, useState } from 'react'
+import { listen } from '@tauri-apps/api/event'
+import { useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { checkForAppUpdate, installAppUpdateSafely, type AppUpdateState } from './updater.js'
 
@@ -9,6 +10,17 @@ interface SupervisorStatus {
   url?: string
   restart_count: number
   last_error?: string
+}
+
+interface DeepLinkEvent { urls?: string[]; argv?: string[] }
+
+function harnessRoute(value: string, base: string): string | undefined {
+  try {
+    const parsed = new URL(value)
+    if (parsed.protocol === 'dshpilot:') return new URL(`${parsed.pathname}${parsed.search}${parsed.hash}`, base).toString()
+    if (parsed.protocol === 'http:' && parsed.hostname === '127.0.0.1' && parsed.port !== '') return parsed.toString()
+  } catch { /* malformed argv is ignored */ }
+  return undefined
 }
 
 function defaultRuntimeManifestUrl(): string {
@@ -22,6 +34,8 @@ function App() {
   const [updateState, setUpdateState] = useState<AppUpdateState>({ state: 'checking' })
   const [runtimeManifestUrl, setRuntimeManifestUrl] = useState(defaultRuntimeManifestUrl)
   const [runtimeMessage, setRuntimeMessage] = useState<string | undefined>()
+  const navigatedToHarness = useRef<string | undefined>(undefined)
+  const pendingDeepLinks = useRef<string[]>([])
 
   useEffect(() => {
     let cancelled = false
@@ -30,6 +44,35 @@ function App() {
     poll(); const timer = window.setInterval(poll, 500)
     return () => { cancelled = true; window.clearInterval(timer) }
   }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    let unlisten: (() => void) | undefined
+    void listen<DeepLinkEvent>('dshpilot://open', event => {
+      const values = [...(event.payload.urls ?? []), ...(event.payload.argv ?? []).filter(value => value.startsWith('dshpilot:'))]
+      if (cancelled) return
+      pendingDeepLinks.current.push(...values)
+      if (status.state === 'ready' && status.url !== undefined) {
+        const next = pendingDeepLinks.current.shift()
+        const route = next === undefined ? undefined : harnessRoute(next, status.url)
+        if (route !== undefined) { navigatedToHarness.current = status.url; window.location.replace(route) }
+      }
+    }).then(value => { if (cancelled) value(); else unlisten = value }).catch(() => undefined)
+    return () => { cancelled = true; unlisten?.() }
+  }, [status.state, status.url])
+
+  useEffect(() => {
+    if (status.state !== 'ready' || status.url === undefined || navigatedToHarness.current === status.url) return
+    const pending = pendingDeepLinks.current.shift()
+    const pendingRoute = pending === undefined ? undefined : harnessRoute(pending, status.url)
+    if (pendingRoute !== undefined) { navigatedToHarness.current = status.url; window.location.replace(pendingRoute); return }
+    try {
+      const url = new URL(status.url)
+      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.port === '') return
+      navigatedToHarness.current = status.url
+      window.location.replace(url.toString())
+    } catch { /* keep the recovery screen visible for a malformed readiness value */ }
+  }, [status.state, status.url])
 
   const retry = (): void => { void invoke<SupervisorStatus>('supervisor_retry').then(setStatus).catch(error => setStatus({ ...status, state: 'failed', last_error: String(error) })) }
   const openHarness = (): void => { if (status.url !== undefined) window.location.replace(status.url) }

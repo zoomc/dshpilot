@@ -28,10 +28,6 @@
     "active": true,
     "targets": "all",
     "icon": ["icons/icon.png", "icons/icon.ico"],
-    "resources": {
-      "../../../runtime/current": "runtime",
-      "../../../runtime/current.json": "runtime/current.json"
-    },
     "createUpdaterArtifacts": true
   },
   "plugins": {
@@ -40,6 +36,11 @@
       "endpoints": [
         "https://github.com/zoomc/dshpilot/releases/latest/download/latest.json"
       ]
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["dshpilot"]
+      }
     }
   }
 }

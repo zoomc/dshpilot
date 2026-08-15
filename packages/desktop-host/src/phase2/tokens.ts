@@ -36,7 +36,7 @@ export function parseOfficialUsage(value: unknown): TokenUsage | undefined {
   const usage = typeof root.usage === 'object' && root.usage !== null ? root.usage as Record<string, unknown> : root
   const inputTokens = firstNumber(usage, ['inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens'])
   const outputTokens = firstNumber(usage, ['outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens'])
-  const cachedTokens = firstNumber(usage, ['cachedTokens', 'cached_tokens', 'cacheReadInputTokens', 'cache_read_input_tokens'])
+  const cachedTokens = firstNumber(usage, ['cachedTokens', 'cached_tokens', 'cacheReadTokens', 'cache_read_tokens', 'cacheReadInputTokens', 'cache_read_input_tokens'])
   const contextWindow = firstNumber(root, ['contextWindow', 'context_window', 'maxContextTokens', 'max_context_tokens'])
     ?? firstNumber(usage, ['contextWindow', 'context_window'])
   if (inputTokens === undefined && outputTokens === undefined && cachedTokens === undefined && contextWindow === undefined) return undefined

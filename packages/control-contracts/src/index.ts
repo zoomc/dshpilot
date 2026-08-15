@@ -116,6 +116,7 @@ export interface PromptAdmissionRequest {
   requestId: string
   sessionId?: string
   input: string
+  mode?: 'queue' | 'steer'
   cwd?: string
   clientId?: string
 }
@@ -130,6 +131,7 @@ export type ControlRequest =
   | { kind: 'interrupt'; requestId: string; sessionId: string }
   | { kind: 'permission_list'; sessionId?: string }
   | { kind: 'permission_reply'; requestId: string; permissionId: string; decision: 'allow' | 'deny' }
+  | { kind: 'question_reply'; requestId: string; rpcId: string; sessionId: string; answers: Array<{ id: string; selected: string[]; custom?: string }> }
   | { kind: 'device_list' }
   | { kind: 'device_revoke'; deviceId: string }
   | { kind: 'device_rotate'; deviceId: string }
@@ -161,21 +163,30 @@ export function assertControlRequest(value: unknown): asserts value is ControlRe
   if (request.kind === 'prompt_admission') {
     assertRequestId(request.requestId)
     if (typeof request.input !== 'string' || request.input.length === 0 || request.input.length > 128_000) throw new Error('prompt input is invalid')
+    if (request.mode !== undefined && request.mode !== 'queue' && request.mode !== 'steer') throw new Error('prompt mode is invalid')
     if (request.sessionId !== undefined && (typeof request.sessionId !== 'string' || !ID.test(request.sessionId))) throw new Error('sessionId is invalid')
     if (request.cwd !== undefined && (typeof request.cwd !== 'string' || request.cwd.length > 4_096)) throw new Error('cwd is invalid')
     if (request.clientId !== undefined && (typeof request.clientId !== 'string' || !ID.test(request.clientId))) throw new Error('clientId is invalid')
     return
   }
-  if (request.kind === 'interrupt' || request.kind === 'permission_reply') assertRequestId(request.requestId)
+  if (request.kind === 'interrupt' || request.kind === 'permission_reply' || request.kind === 'question_reply') assertRequestId(request.requestId)
   if (request.kind === 'interrupt' && (typeof request.sessionId !== 'string' || !ID.test(request.sessionId))) throw new Error('sessionId is invalid')
   if (request.kind === 'permission_list' && request.sessionId !== undefined && (typeof request.sessionId !== 'string' || !ID.test(request.sessionId))) throw new Error('sessionId is invalid')
   if (request.kind === 'permission_reply') {
     if (typeof request.permissionId !== 'string' || !ID.test(request.permissionId)) throw new Error('permissionId is invalid')
     if (request.decision !== 'allow' && request.decision !== 'deny') throw new Error('permission decision is invalid')
   }
+  if (request.kind === 'question_reply') {
+    assertRequestId(request.rpcId)
+    if (typeof request.sessionId !== 'string' || !ID.test(request.sessionId) || !Array.isArray(request.answers) || request.answers.length === 0 || request.answers.length > 32) throw new Error('question reply is invalid')
+    for (const rawAnswer of request.answers) {
+      const answer = rawAnswer as Record<string, unknown>
+      if (typeof answer !== 'object' || answer === null || typeof answer.id !== 'string' || !ID.test(answer.id) || !Array.isArray(answer.selected) || answer.selected.some((item: unknown) => typeof item !== 'string' || item.length > 512) || (answer.custom !== undefined && (typeof answer.custom !== 'string' || answer.custom.length > 4_000))) throw new Error('question answer is invalid')
+    }
+  }
   if (request.kind === 'device_revoke' && (typeof request.deviceId !== 'string' || !ID.test(request.deviceId))) throw new Error('deviceId is invalid')
   if (request.kind === 'device_rotate' && (typeof request.deviceId !== 'string' || !ID.test(request.deviceId))) throw new Error('deviceId is invalid')
-  if (!['server_info', 'runtime_status', 'session_list', 'task_list', 'events', 'prompt_admission', 'interrupt', 'permission_list', 'permission_reply', 'device_list', 'device_revoke', 'device_rotate'].includes(request.kind)) throw new Error(`unsupported control request: ${request.kind}`)
+  if (!['server_info', 'runtime_status', 'session_list', 'task_list', 'events', 'prompt_admission', 'interrupt', 'permission_list', 'permission_reply', 'question_reply', 'device_list', 'device_revoke', 'device_rotate'].includes(request.kind)) throw new Error(`unsupported control request: ${request.kind}`)
 }
 
 export function parseControlRequest(text: string): ControlRequest {

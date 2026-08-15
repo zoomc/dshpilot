@@ -64,9 +64,9 @@ jobs:
       - name: Embed Runtime verification key
         shell: bash
         run: echo "DSHPILOT_RUNTIME_PUBLIC_KEY=$(cat runtime/current/public.key)" >> "$GITHUB_ENV"
-      - name: Generate release version overlay
+      - name: Generate release version and Runtime resource overlay
         shell: bash
-        run: node -e "require('fs').writeFileSync('apps/desktop/src-tauri/tauri.release.json', JSON.stringify({version: process.env.GITHUB_REF_NAME.replace(/^v/, '')}))"
+        run: node -e "require('fs').writeFileSync('apps/desktop/src-tauri/tauri.release.json', JSON.stringify({version: process.env.GITHUB_REF_NAME.replace(/^v/, ''), bundle: {resources: {'../../../runtime/current': 'runtime', '../../../runtime/current.json': 'runtime/current.json'}}}))"
       - name: Build and publish signed Tauri release
         uses: tauri-apps/tauri-action@v0
         env:

@@ -1,11 +1,23 @@
 import { mkdtemp, readFile } from 'node:fs/promises'
+import { crc32 } from 'node:zlib'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
-  LocalDocumentProvider, McpManager, assertSafeRelativePath, createDesktopNotification, estimateTokens, inspectTokenUsage,
-  parseMcpImport, renderMcpPatch, shouldNotify,
+  LocalDocumentProvider, LocalDocumentTools, McpManager, assertSafeRelativePath, createDesktopNotification, estimateTokens, inspectTokenUsage,
+  officialMcpPluginConfig, parseMcpImport, renderMcpPatch, shouldNotify,
 } from './index.js'
+
+function zip(files: Record<string, string>): Uint8Array {
+  const locals: Buffer[] = []; const central: Buffer[] = []; let offset = 0
+  for (const [name, value] of Object.entries(files)) {
+    const filename = Buffer.from(name); const content = Buffer.from(value); const checksum = crc32(content)
+    const local = Buffer.alloc(30 + filename.length + content.length); local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt16LE(0, 6); local.writeUInt16LE(0, 8); local.writeUInt32LE(checksum, 14); local.writeUInt32LE(content.length, 18); local.writeUInt32LE(content.length, 22); local.writeUInt16LE(filename.length, 26); filename.copy(local, 30); content.copy(local, 30 + filename.length); locals.push(local)
+    const directory = Buffer.alloc(46 + filename.length); directory.writeUInt32LE(0x02014b50, 0); directory.writeUInt16LE(20, 4); directory.writeUInt16LE(20, 6); directory.writeUInt16LE(0, 8); directory.writeUInt16LE(0, 10); directory.writeUInt32LE(checksum, 16); directory.writeUInt32LE(content.length, 20); directory.writeUInt32LE(content.length, 24); directory.writeUInt16LE(filename.length, 28); directory.writeUInt32LE(offset, 42); filename.copy(directory, 46); central.push(directory); offset += local.length
+  }
+  const directoryOffset = offset; const directorySize = central.reduce((sum, value) => sum + value.length, 0); const end = Buffer.alloc(22); end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(central.length, 8); end.writeUInt16LE(central.length, 10); end.writeUInt32LE(directorySize, 12); end.writeUInt32LE(directoryOffset, 16)
+  return new Uint8Array(Buffer.concat([...locals, ...central, end]))
+}
 
 describe('MCP manager and import', () => {
   it('redacts literal secrets and generates an official plugin patch', () => {
@@ -56,6 +68,34 @@ describe('document provider and notifications', () => {
     await expect(provider.addBytes(new Uint8Array(), 'empty.txt')).rejects.toThrow('empty')
     expect(() => assertSafeRelativePath('../outside.txt')).toThrow('traversal')
     expect(() => assertSafeRelativePath('C:/outside.txt')).toThrow('traversal')
+  })
+
+  it('parses the required document formats through bounded provider tools', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-parsers-')); const provider = new LocalDocumentProvider(root); const tools = new LocalDocumentTools(provider)
+    const docx = await provider.addBytes(zip({ 'word/document.xml': '<document><body><p>Hello <b>DOCX</b></p></body></document>' }), 'brief.docx')
+    expect((await tools.read(docx)).text).toContain('Hello DOCX')
+    const xlsx = await provider.addBytes(zip({
+      'xl/workbook.xml': '<workbook xmlns:r="x"><sheets><sheet name="Data" r:id="rId1"/></sheets></workbook>',
+      'xl/_rels/workbook.xml.rels': '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>',
+      'xl/worksheets/sheet1.xml': '<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>42</v></c></row></sheetData></worksheet>',
+      'xl/sharedStrings.xml': '<sst><si><t>Name</t></si></sst>',
+    }), 'data.xlsx')
+    expect(await tools.spreadsheetSheetInfo(xlsx)).toEqual([{ name: 'Data', index: 0, rows: 1, columns: 2 }])
+    expect((await tools.spreadsheetReadRange(xlsx, 'Data', 'A1:B1')).rows).toEqual([['Name', '42']])
+    const pptx = await provider.addBytes(zip({ 'ppt/slides/slide1.xml': '<p:sld><p:cSld><a:t>Slide one</a:t></p:cSld></p:sld>' }), 'deck.pptx')
+    expect((await tools.presentationSlide(pptx, 0)).text).toContain('Slide one')
+    const csv = await provider.addBytes(new TextEncoder().encode('name,description\n"Ada, L.",builder\n'), 'people.csv')
+    expect((await tools.read(csv)).rows).toEqual([['name', 'description'], ['Ada, L.', 'builder']])
+    const pdf = await provider.addBytes(new TextEncoder().encode('%PDF-1.7 /Type /Page (Hello PDF)'), 'note.pdf')
+    expect((await tools.inspect(pdf)).pages).toBe(1)
+    expect((await tools.search(docx, 'docx')).matches[0]?.line).toBe(1)
+  })
+
+  it('renders the official MCP plugin configuration including reconnect policy', () => {
+    const preview = parseMcpImport(JSON.stringify({ mcpServers: { tools: { command: 'fixture', reconnect: { maxAttempts: 3 } } } }))
+    const config = officialMcpPluginConfig(preview.servers[0]!)
+    expect(config.reconnect?.maxAttempts).toBe(3)
+    expect(renderMcpPatch(preview.servers)).toContain('reconnect:')
   })
 
   it('allows only the four Phase 2 notification kinds', () => {

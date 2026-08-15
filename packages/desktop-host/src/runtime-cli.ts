@@ -1,6 +1,7 @@
-import { cp, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from 'node:fs/promises'
-import { execFile } from 'node:child_process'
+import { cp, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat } from 'node:fs/promises'
+import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
+import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { downloadAndInstallRuntime, RuntimePointers, resolveAppDataPaths, validateArchiveEntries, validateRuntimeManifest } from './index.js'
 
@@ -42,6 +43,44 @@ async function smokeRuntime(root: string): Promise<void> {
   const node = join(root, process.platform === 'win32' ? 'node.exe' : 'node')
   const dsh = join(root, 'dsh', 'lib', 'bin.js')
   if (!(await stat(node).then(info => info.isFile()).catch(() => false)) || !(await stat(dsh).then(info => info.isFile()).catch(() => false))) throw new Error('runtime smoke failed: node or dsh entry is missing')
+  const home = await mkdtemp(join(tmpdir(), 'dshpilot-runtime-smoke-'))
+  try {
+    const launchArgs = [dsh, 'web']
+    if (await stat(join(root, 'dshpilot.patch.yml')).then(() => true).catch(() => false)) launchArgs.push('--patch', join(root, 'dshpilot.patch.yml'))
+    launchArgs.push('--host', '127.0.0.1', '--port', '0')
+    const child = spawn(node, launchArgs, { cwd: join(root, 'dsh'), env: { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1' }, stdio: ['ignore', 'pipe', 'pipe'] })
+    let output = ''
+    let settled = false
+    const readiness = new Promise<string>((resolveReady, rejectReady) => {
+      const timer = setTimeout(() => rejectReady(new Error(`runtime smoke readiness timed out: ${output.slice(-4_000)}`)), 30_000)
+      const onData = (chunk: Buffer): void => {
+        output += chunk.toString('utf8')
+        const url = output.match(/http:\/\/127\.0\.0\.1:\d+/u)?.[0]
+        if (url !== undefined && !settled) { settled = true; clearTimeout(timer); resolveReady(url) }
+      }
+      child.stdout.on('data', onData); child.stderr.on('data', onData)
+      child.once('error', error => { if (!settled) { settled = true; clearTimeout(timer); rejectReady(error) } })
+      child.once('exit', code => { if (!settled) { settled = true; clearTimeout(timer); rejectReady(new Error(`runtime smoke Harness exited with ${String(code)}: ${output.slice(-4_000)}`)) } })
+    })
+    try {
+      const url = await readiness
+      let healthy = false
+      const deadline = Date.now() + 30_000
+      while (Date.now() < deadline) {
+        try {
+          const rootResponse = await fetch(url)
+          const healthResponse = await fetch(`${url}/__dshpilot/health`)
+          const health = await healthResponse.json() as { status?: string; apiReady?: boolean; webUiReady?: boolean }
+          if (rootResponse.ok && (await rootResponse.text()).toLowerCase().includes('<!doctype html>') && healthResponse.ok && health.status === 'ready' && health.webUiReady === true && health.apiReady === true) { healthy = true; break }
+        } catch { /* Harness is still starting */ }
+        await new Promise(resolveSleep => setTimeout(resolveSleep, 250))
+      }
+      if (!healthy) throw new Error(`runtime smoke health check failed: ${output.slice(-4_000)}`)
+    } finally {
+      if (child.exitCode === null) child.kill('SIGTERM')
+      await new Promise<void>(resolveExit => { const timer = setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); resolveExit() }, 5_000); child.once('exit', () => { clearTimeout(timer); resolveExit() }) })
+    }
+  } finally { await rm(home, { recursive: true, force: true }) }
 }
 
 async function withUpdateLock<T>(appData: string, action: () => Promise<T>): Promise<T> {
