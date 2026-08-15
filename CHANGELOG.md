@@ -6,3 +6,4 @@
 - Added Phase 2 Host foundations for MCP Manager/import, Context/Token inspection, safe document attachments, and the four native notification kinds.
 - Added Harness patch generation, plugin loading smoke coverage, and the scheduled upstream Guardian workflow.
 - Fixed Windows CI resource packaging by removing the recursive Junction workaround.
+- Added source reviews for Paseo, OpenCode, Qwen Code, and Goose, plus the final architecture improvement plan covering the remaining Phase 1/2 work and the Phase 3 self-hosted remote roadmap.
