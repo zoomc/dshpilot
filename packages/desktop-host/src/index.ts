@@ -1,7 +1,7 @@
 import { createHash, createPublicKey, verify as verifySignature } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { homedir, tmpdir } from 'node:os'
+import { homedir, platform, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
 export interface RuntimeManifest {
@@ -288,7 +288,12 @@ export async function downloadAndInstallRuntime(manifest: RuntimeManifest, point
   }
 }
 
-export function defaultAppDataRoot(): string { return process.env.DSHPILOT_APP_DATA ?? join(homedir(), 'Library', 'Application Support', 'DSHPilot') }
+export function defaultAppDataRoot(): string {
+  if (process.env.DSHPILOT_APP_DATA !== undefined) return process.env.DSHPILOT_APP_DATA
+  if (platform() === 'win32') return join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'DSHPilot')
+  if (platform() === 'darwin') return join(homedir(), 'Library', 'Application Support', 'DSHPilot')
+  return join(process.env.XDG_DATA_HOME ?? join(homedir(), '.local', 'share'), 'DSHPilot')
+}
 export function testAppDataRoot(): string { return join(tmpdir(), 'dshpilot-test-data') }
 
 export * from './phase2/attachments.js'

@@ -98,6 +98,7 @@ const SERVER_NAME = /^[A-Za-z0-9_-]{1,32}$/u
 const ID_NAME = /^[A-Za-z0-9._-]{1,80}$/u
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u
 const SECRET_KEY = /(token|secret|password|api[-_]?key|authorization|credential)/iu
+const SECRET_VALUE = /(?:^|\s)(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_-]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|bearer\s+[A-Za-z0-9._~+/=-]{8,})(?:$|\s)/iu
 const DEFAULT_RECONNECT: McpReconnectPolicy = Object.freeze({ enabled: true, initialDelayMs: 500, maxDelayMs: 30_000, maxAttempts: 10 })
 
 function object(value: unknown): Record<string, unknown> {
@@ -131,7 +132,7 @@ function safeSecretMap(
   for (const [key, raw] of Object.entries(object(value))) {
     if (typeof raw !== 'string' || raw.length === 0) continue
     const ref = environmentReference(raw)
-    if (SECRET_KEY.test(key) || keyLabel === 'headers' && key.toLowerCase() === 'authorization') {
+    if (SECRET_KEY.test(key) || SECRET_VALUE.test(raw) || keyLabel === 'headers' && key.toLowerCase() === 'authorization') {
       if (ref !== undefined && ENV_NAME.test(ref)) refs[key] = ref
       else warnings.push(`${keyLabel}.${key}: secret value omitted; use an environment reference like $${key}`)
     } else {
@@ -151,7 +152,12 @@ function toRecord(idHint: string, raw: unknown, warnings: string[]): McpServerRe
   const id = stableId(String(input.id ?? idHint ?? serverName))
   const secretEnv = safeSecretMap(input.env, 'env', warnings)
   const secretHeaders = safeSecretMap(input.headers, 'headers', warnings)
-  const args = Array.isArray(input.args) ? input.args.filter((item): item is string => typeof item === 'string') : []
+  const rawArgs = Array.isArray(input.args) ? input.args.filter((item): item is string => typeof item === 'string') : []
+  const args: string[] = []
+  for (const [index, value] of rawArgs.entries()) {
+    if (SECRET_VALUE.test(value) || index > 0 && SECRET_KEY.test(rawArgs[index - 1] ?? '')) { warnings.push(`${idHint}.args[${index}]: secret value omitted; use an environment reference instead`); args.push('') }
+    else args.push(value)
+  }
   if (transport === 'stdio' && typeof input.command !== 'string') throw new Error(`${id}: stdio MCP server requires command`)
   if (transport === 'streamable-http' && typeof input.url !== 'string') throw new Error(`${id}: HTTP MCP server requires url`)
   return {
@@ -195,6 +201,8 @@ export function validateMcpServer(record: McpServerRecord): McpServerRecord {
   if (record.transport === 'stdio' && (!record.command || record.url !== undefined)) throw new Error(`${record.id}: invalid stdio config`)
   if (record.transport === 'streamable-http' && (!record.url || record.command !== undefined)) throw new Error(`${record.id}: invalid HTTP config`)
   if (!Array.isArray(record.args) || record.args.some(item => typeof item !== 'string')) throw new Error(`${record.id}: args must be strings`)
+  if (record.args.some((value, index) => SECRET_VALUE.test(value) || value.length > 0 && index > 0 && SECRET_KEY.test(record.args[index - 1] ?? ''))) throw new Error(`${record.id}: secret command arguments must use an environment reference`)
+  if (Object.entries(record.env).some(([key, value]) => SECRET_KEY.test(key) || SECRET_VALUE.test(value)) || Object.entries(record.headers).some(([key, value]) => SECRET_KEY.test(key) || SECRET_VALUE.test(value) || key.toLowerCase() === 'authorization')) throw new Error(`${record.id}: secret values must use environment references`)
   for (const key of Object.keys(record.envRefs)) if (!ENV_NAME.test(record.envRefs[key] ?? '')) throw new Error(`${record.id}: invalid environment reference`)
   const env = { ...record.env }; const headers = { ...record.headers }
   for (const key of Object.keys(env)) if (SECRET_KEY.test(key)) delete env[key]

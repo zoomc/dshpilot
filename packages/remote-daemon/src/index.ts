@@ -11,7 +11,8 @@ import {
   type EventPage, type SessionSummary, type TaskSummary, type PermissionSummary,
 } from '@dshpilot/control-contracts'
 export * from './relay.js'
-import { RelayRouter, signRelayReady, verifyPairingProof, verifyRelayHandshake, type RelayHandshake, type RelayHandshakeExpectations, type RelayIdentity } from './relay.js'
+export * from './relay-tunnel.js'
+import { RelayRouter, signRelayReady, verifyPairingProof, verifyRelayHandshake, type EncryptedRelayFrame, type RelayHandshake, type RelayHandshakeExpectations, type RelayIdentity } from './relay.js'
 
 interface EventStoreOptions { filePath?: string; maxEvents?: number; maxFileBytes?: number }
 
@@ -273,12 +274,18 @@ export interface ControlPlaneAdapter {
   admitPrompt?: (request: Extract<ControlRequest, { kind: 'prompt_admission' }>) => Promise<{ taskId: string }>
   interrupt?: (sessionId: string) => Promise<void>
   permissions?: (sessionId?: string) => Promise<PermissionSummary[]>
+  questions?: () => Promise<unknown[]>
   permissionReply?: (permissionId: string, decision: 'allow' | 'deny') => Promise<void>
   questionReply?: (rpcId: string, sessionId: string, answers: Array<{ id: string; selected: string[]; custom?: string }>) => Promise<void>
   artifacts?: () => Promise<unknown[]>
   artifactRead?: (artifactId: string) => Promise<Uint8Array>
+  artifactOpen?: (artifactId: string) => Promise<{ opened: boolean }>
+  artifactReveal?: (artifactId: string) => Promise<{ opened: boolean }>
   git?: (cwd: string, path?: string) => Promise<unknown>
+  gitOpen?: (cwd: string, path: string) => Promise<{ opened: boolean }>
+  gitReveal?: (cwd: string, path: string) => Promise<{ opened: boolean }>
   resources?: () => Promise<unknown[]>
+  resourceResolve?: (resourceId: string, operation: string, input: Record<string, unknown>) => Promise<unknown>
   lineage?: (sessionId: string) => Promise<unknown[]>
 }
 
@@ -290,6 +297,9 @@ export interface ResourceAuthorizationContext {
   workspaceId?: string
   cwd?: string
   artifactId?: string
+  resourceId?: string
+  permissionId?: string
+  questionId?: string
   request?: ControlRequest
 }
 
@@ -303,6 +313,8 @@ export interface ControlPlaneServerOptions {
   remoteEnabled?: boolean
   tls?: { key: string | Buffer; cert: string | Buffer }
   corsOrigins?: readonly string[]
+  /** Additional Host header names accepted when the daemon is exposed remotely. */
+  allowedHosts?: readonly string[]
   eventsPath?: string
   devicesPath?: string
   /** Keep admin scopes out of HTTP pairing unless the operator explicitly opts in. */
@@ -326,6 +338,7 @@ export class ControlPlaneServer {
   private readonly server: Server
   private readonly relayServer?: WebSocketServer
   private readonly relayRouter = new RelayRouter()
+  private readonly relaySockets = new Set<WebSocket>()
   private readonly options: Required<Pick<ControlPlaneServerOptions, 'version' | 'host' | 'port' | 'remoteEnabled'>> & ControlPlaneServerOptions
   private addressValue?: { host: string; port: number }
   private readonly admittedRequests = new Map<string, string>()
@@ -361,13 +374,14 @@ export class ControlPlaneServer {
     return this.addressValue
   }
 
-  async stop(): Promise<void> { this.events.append('server.disconnected', {}); await this.events.flush(); this.relayServer?.close(); await new Promise<void>(resolveStop => this.server.close(() => resolveStop())) }
+  async stop(): Promise<void> { this.events.append('server.disconnected', {}); await this.events.flush(); for (const socket of this.relaySockets) socket.terminate(); this.relaySockets.clear(); this.relayServer?.close(); await new Promise<void>(resolveStop => this.server.close(() => resolveStop())) }
   address(): { host: string; port: number } | undefined { return this.addressValue }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`)
       this.headers(response, request)
+      this.validateRequestSecurity(request, url)
       if (request.method === 'OPTIONS') { response.writeHead(204); response.end(); return }
       this.enforceRateLimit(request)
       if (url.pathname === '/health' && request.method === 'GET') { this.json(response, 200, { ok: true, protocolVersion: CONTROL_PROTOCOL_VERSION }); return }
@@ -376,11 +390,17 @@ export class ControlPlaneServer {
       if (url.pathname === '/v1/sessions' && request.method === 'GET') { await this.authorizeResource(request, 'read', { operation: 'session_list' }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.sessions?.() ?? Promise.resolve([])) }); return }
       if (url.pathname === '/v1/tasks' && request.method === 'GET') { await this.authorizeResource(request, 'read', { operation: 'task_list' }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.tasks?.() ?? Promise.resolve([])) }); return }
       if (url.pathname === '/v1/permissions' && request.method === 'GET') { const sessionId = url.searchParams.get('sessionId') ?? undefined; await this.authorizeResource(request, 'read', { operation: 'permission_list', ...(sessionId === undefined ? {} : { sessionId }) }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.permissions?.(sessionId) ?? Promise.resolve([])) }); return }
+      if (url.pathname === '/v1/questions' && request.method === 'GET') { await this.authorizeResource(request, 'read', { operation: 'question_list' }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.questions?.() ?? Promise.resolve([])) }); return }
       if (url.pathname === '/v1/artifacts' && request.method === 'GET') { await this.authorizeResource(request, 'read', { operation: 'artifact_list' }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.artifacts?.() ?? Promise.resolve([])) }); return }
       if (url.pathname === '/v1/git' && request.method === 'GET') { const cwd = url.searchParams.get('cwd') ?? ''; await this.authorizeResource(request, 'read', { operation: 'git_summary', cwd }); if (this.options.adapter?.git === undefined) throw new Error('git adapter is not configured'); this.json(response, 200, { ok: true, value: await this.options.adapter.git(cwd, url.searchParams.get('path') ?? undefined) }); return }
       if (url.pathname === '/v1/resources' && request.method === 'GET') { await this.authorizeResource(request, 'read', { operation: 'resource_list' }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.resources?.() ?? Promise.resolve([])) }); return }
+      if (url.pathname.startsWith('/v1/resources/') && request.method === 'GET') { const resourceId = decodeURIComponent(url.pathname.slice('/v1/resources/'.length)); await this.authorizeResource(request, 'read', { operation: 'resource_resolve', resourceId }); if (this.options.adapter?.resourceResolve === undefined) throw new Error('resource provider adapter is not configured'); const operation = url.searchParams.get('operation') ?? 'inspect'; const input = Object.fromEntries(url.searchParams.entries()); delete input.operation; this.json(response, 200, { ok: true, value: await this.options.adapter.resourceResolve(resourceId, operation, input) }); return }
       if (url.pathname.startsWith('/v1/sessions/') && url.pathname.endsWith('/lineage') && request.method === 'GET') { const sessionId = decodeURIComponent(url.pathname.slice('/v1/sessions/'.length, -'/lineage'.length)); await this.authorizeResource(request, 'read', { operation: 'session_lineage', sessionId }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.lineage?.(sessionId) ?? Promise.resolve([])) }); return }
+      if (url.pathname.startsWith('/v1/artifacts/') && url.pathname.endsWith('/open') && request.method === 'POST') { const artifactId = decodeURIComponent(url.pathname.slice('/v1/artifacts/'.length, -'/open'.length)); await this.authorizeResource(request, 'control', { operation: 'artifact_open', artifactId }); if (this.options.adapter?.artifactOpen === undefined) throw new Error('artifact open adapter is not configured'); this.json(response, 200, { ok: true, value: await this.options.adapter.artifactOpen(artifactId) }); return }
+      if (url.pathname.startsWith('/v1/artifacts/') && url.pathname.endsWith('/reveal') && request.method === 'POST') { const artifactId = decodeURIComponent(url.pathname.slice('/v1/artifacts/'.length, -'/reveal'.length)); await this.authorizeResource(request, 'control', { operation: 'artifact_reveal', artifactId }); if (this.options.adapter?.artifactReveal === undefined) throw new Error('artifact reveal adapter is not configured'); this.json(response, 200, { ok: true, value: await this.options.adapter.artifactReveal(artifactId) }); return }
       if (url.pathname.startsWith('/v1/artifacts/') && request.method === 'GET') { const artifactId = decodeURIComponent(url.pathname.slice('/v1/artifacts/'.length)); await this.authorizeResource(request, 'read', { operation: 'artifact_read', artifactId }); if (this.options.adapter?.artifactRead === undefined) throw new Error('artifact adapter is not configured'); const data = await this.options.adapter.artifactRead(artifactId); response.writeHead(200, { 'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'content-length': data.byteLength }); response.end(Buffer.from(data)); return }
+      if (url.pathname === '/v1/git/open' && request.method === 'POST') { const value = await readJson(request); const cwd = String(value.cwd ?? ''); const path = String(value.path ?? ''); await this.authorizeResource(request, 'control', { operation: 'git_open', cwd }); if (this.options.adapter?.gitOpen === undefined) throw new Error('git open adapter is not configured'); this.json(response, 200, { ok: true, value: await this.options.adapter.gitOpen(cwd, path) }); return }
+      if (url.pathname === '/v1/git/reveal' && request.method === 'POST') { const value = await readJson(request); const cwd = String(value.cwd ?? ''); const path = String(value.path ?? ''); await this.authorizeResource(request, 'control', { operation: 'git_reveal', cwd }); if (this.options.adapter?.gitReveal === undefined) throw new Error('git reveal adapter is not configured'); this.json(response, 200, { ok: true, value: await this.options.adapter.gitReveal(cwd, path) }); return }
       if (url.pathname === '/v1/events' && request.method === 'GET') { this.authorize(request, 'read'); this.json(response, 200, { ok: true, value: this.events.page(Number(url.searchParams.get('after') ?? 0), Number(url.searchParams.get('limit') ?? 500), url.searchParams.get('generation') ?? undefined) }); return }
       if (url.pathname === '/v1/events/stream' && request.method === 'GET') { this.authorize(request, 'read'); await this.sse(request, response, Number(url.searchParams.get('after') ?? request.headers['last-event-id'] ?? 0), url.searchParams.get('generation') ?? undefined); return }
       if (url.pathname === '/v1/pairing/offer' && request.method === 'POST') { this.authorizeLocalOrAdmin(request); this.json(response, 200, { ok: true, value: this.devices.createOffer() }); return }
@@ -450,8 +470,13 @@ export class ControlPlaneServer {
   private serverInfo(): ServerInfo {
     const capabilities = ['events', 'sessions', 'tasks', 'runtime', 'pairing', 'restricted-control', 'permissions', 'questions', 'steer', 'refresh-token']
     if (this.options.adapter?.artifacts !== undefined) capabilities.push('artifacts')
+    if (this.options.adapter?.artifactOpen !== undefined) capabilities.push('artifact-open')
+    if (this.options.adapter?.artifactReveal !== undefined) capabilities.push('artifact-reveal')
     if (this.options.adapter?.git !== undefined) capabilities.push('git')
+    if (this.options.adapter?.gitOpen !== undefined) capabilities.push('git-open')
+    if (this.options.adapter?.gitReveal !== undefined) capabilities.push('git-reveal')
     if (this.options.adapter?.resources !== undefined) capabilities.push('resources')
+    if (this.options.adapter?.resourceResolve !== undefined) capabilities.push('resource-providers')
     if (this.options.adapter?.lineage !== undefined) capabilities.push('lineage')
     if (this.options.relayEnabled) capabilities.push('relay-e2ee')
     return { protocolVersion: CONTROL_PROTOCOL_VERSION, serverId: this.devices.serverId(), name: this.options.name ?? 'DSHPilot', version: this.options.version, capabilities, remoteEnabled: this.options.remoteEnabled, loopbackOnly: isLoopbackHost(this.options.host), publicKey: this.devices.publicKey() }
@@ -464,7 +489,23 @@ export class ControlPlaneServer {
     if (window.count > 600) throw new RateLimitError()
     if (this.requestWindows.size > 1_000) for (const [address, state] of this.requestWindows) if (now - state.windowStartedAt > 60_000) this.requestWindows.delete(address)
   }
-  private headers(response: ServerResponse, request: IncomingMessage): void { const origin = request.headers.origin; if (origin !== undefined && (this.options.corsOrigins?.includes(origin) ?? false)) response.setHeader('Access-Control-Allow-Origin', origin); response.setHeader('Access-Control-Allow-Headers', 'authorization,content-type,last-event-id'); response.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS'); response.setHeader('Vary', 'Origin') }
+  private headers(response: ServerResponse, request: IncomingMessage): void { const origin = request.headers.origin; if (origin !== undefined && (this.options.corsOrigins?.includes(origin) ?? false)) response.setHeader('Access-Control-Allow-Origin', origin); response.setHeader('Access-Control-Allow-Headers', 'authorization,content-type,last-event-id'); response.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS'); response.setHeader('Vary', 'Origin'); response.setHeader('X-Content-Type-Options', 'nosniff') }
+  private validateRequestSecurity(request: IncomingMessage, url: URL): void {
+    const hostHeader = request.headers.host
+    if (hostHeader === undefined || hostHeader.length > 255) throw new Error('Host header is required')
+    const host = new URL(`http://${hostHeader}`).hostname.toLowerCase().replace(/^\[|\]$/gu, '')
+    const configuredHosts = new Set([this.options.host.toLowerCase(), ...(this.options.allowedHosts ?? []).map(value => value.toLowerCase()), '127.0.0.1', 'localhost', '::1'])
+    if (!configuredHosts.has(host) && !(isLoopbackHost(this.options.host) && isLoopbackHost(host))) throw new Error('Host header is not allowed')
+    const origin = request.headers.origin
+    if (origin === undefined) return
+    let parsedOrigin: URL
+    try { parsedOrigin = new URL(origin) } catch { throw new Error('Origin header is invalid') }
+    const expectedOrigin = `${this.options.tls === undefined ? 'http' : 'https'}://${hostHeader}`
+    const sameOrigin = parsedOrigin.origin === new URL(expectedOrigin).origin
+    if (!(this.options.corsOrigins?.includes(origin) ?? false) && !sameOrigin) throw new Error('Origin is not allowed')
+    if (!this.options.remoteEnabled && !isLoopbackHost(host)) throw new Error('non-loopback Origin is not allowed in local mode')
+    void url
+  }
   private json(response: ServerResponse, status: number, value: unknown): void { response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); response.end(JSON.stringify(value)) }
   private authorizeLocalOrAdmin(request: IncomingMessage): void { if (this.options.allowLocalPairingOffer && isLoopbackHost(request.socket.remoteAddress ?? '')) return; if (this.authorize(request, 'admin') !== undefined) return; throw new AuthError() }
   private authorizePairRequest(request: IncomingMessage): boolean {
@@ -511,17 +552,20 @@ export class ControlPlaneServer {
   private async handleRelayUpgrade(request: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer): Promise<void> {
     try {
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`)
+      this.validateRequestSecurity(request, url)
       if (url.pathname !== '/v1/relay' || this.relayServer === undefined) { socket.destroy(); return }
       const device = this.authorize(request, 'control')
+      if (device?.identityPublicKey === undefined) { socket.destroy(); return }
       this.relayServer.handleUpgrade(request, socket, head, ws => this.handleRelayConnection(ws, device))
     } catch { socket.destroy() }
   }
 
   private handleRelayConnection(ws: WebSocket, device?: DeviceInfo): void {
+    this.relaySockets.add(ws)
     const connectionId = randomUUID()
     let sessionId: string | undefined
     let unregister: (() => void) | undefined
-    const close = (): void => { unregister?.(); unregister = undefined; sessionId = undefined }
+    const close = (): void => { this.relaySockets.delete(ws); unregister?.(); unregister = undefined; sessionId = undefined }
     ws.on('message', (data: RawData) => {
       try {
         const bytes = Buffer.isBuffer(data) ? data : Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data)
@@ -547,7 +591,7 @@ export class ControlPlaneServer {
         if (value.sessionId !== sessionId || value.version !== 1 || (value.direction !== 'client_to_server' && value.direction !== 'server_to_client') || !Number.isSafeInteger(value.frameSeq)
           || typeof value.nonce !== 'string' || typeof value.iv !== 'string' || typeof value.tag !== 'string' || typeof value.ciphertext !== 'string'
           || (value.aad !== undefined && typeof value.aad !== 'string')) throw new Error('relay encrypted frame envelope is invalid')
-        this.relayRouter.forward(sessionId, connectionId, bytes)
+        this.relayRouter.forwardAuthenticated(sessionId, connectionId, value as unknown as EncryptedRelayFrame, bytes)
       } catch { ws.close(1008, 'invalid relay frame') }
     })
     ws.on('close', close)

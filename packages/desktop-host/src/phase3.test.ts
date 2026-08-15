@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { ControlEvent } from '@dshpilot/control-contracts'
-import { ArtifactStore, SessionLineageStore, TaskProjection, isPathInside } from './index.js'
+import { ArtifactStore, ResourceProviderRegistry, SessionLineageStore, TaskProjection, isPathInside } from './index.js'
 
 describe('Phase 3 projections and artifacts', () => {
   it('stores immutable artifacts by digest and supports explicit Save As/Reveal', async () => {
@@ -25,5 +25,13 @@ describe('Phase 3 projections and artifacts', () => {
     const lineage = new SessionLineageStore(); lineage.add({ sessionId: 'root', rootSessionId: 'root', createdAt: new Date().toISOString() }); lineage.add({ sessionId: 'child', parentSessionId: 'root', rootSessionId: 'root', createdAt: new Date().toISOString() })
     expect(lineage.lineage('child').map(item => item.sessionId)).toEqual(['root', 'child']); expect(() => lineage.add({ sessionId: 'x', parentSessionId: 'x', rootSessionId: 'x', createdAt: new Date().toISOString() })).toThrow('own parent')
     expect(isPathInside(root, join(root, 'saved'))).toBe(true)
+  })
+
+  it('keeps resource operations behind a provider registry seam', async () => {
+    const registry = new ResourceProviderRegistry()
+    const dispose = registry.register('file', async (resource, operation, input) => ({ resourceId: resource.resourceId, operation, input }))
+    const value = await registry.resolve({ resourceId: 'file-1', kind: 'file', label: 'File', locator: '/tmp/file', createdAt: new Date().toISOString() }, 'read', { offset: 12 })
+    expect(value).toEqual({ resourceId: 'file-1', operation: 'read', input: { offset: 12 } })
+    expect(registry.list()).toEqual(['file']); dispose(); expect(registry.list()).toEqual([])
   })
 })

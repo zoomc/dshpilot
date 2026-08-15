@@ -23,10 +23,11 @@ jobs:
           node-version: 22.19.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --dir vendor/deepseek-harness install --frozen-lockfile
+      - run: pnpm --dir vendor/deepseek-harness install --frozen-lockfile --ignore-scripts
         env:
           CI: true
-      - run: pnpm --dir vendor/deepseek-harness run build
+      - run: npm --prefix vendor/deepseek-harness run build:lib
+      - run: npm --prefix vendor/deepseek-harness/apps/web run build
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
@@ -63,10 +64,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --dir vendor/deepseek-harness install --frozen-lockfile
+      - run: pnpm --dir vendor/deepseek-harness install --frozen-lockfile --ignore-scripts
         env:
           CI: true
-      - run: pnpm --dir vendor/deepseek-harness run build
+      - run: npm --prefix vendor/deepseek-harness run build:lib
+      - run: npm --prefix vendor/deepseek-harness/apps/web run build
       - run: pnpm run build
       - run: pnpm runtime:bundle -- --output runtime
       - name: Select packaged runtime for smoke
@@ -89,10 +91,31 @@ jobs:
             Where-Object { $_.Name -in @('dshpilot-desktop.exe', 'DSHPilot.exe') } |
             Select-Object -First 1
           if ($null -eq $binary) { throw 'clean NSIS install did not produce an application binary' }
+          $statusPath = Join-Path $env:GITHUB_WORKSPACE 'ci-status.json'
+          $handoffPath = Join-Path $env:GITHUB_WORKSPACE 'ci-status.single-instance.json'
+          Remove-Item $statusPath -Force -ErrorAction SilentlyContinue
+          Remove-Item $handoffPath -Force -ErrorAction SilentlyContinue
+          $env:DSHPILOT_CI_STATUS_PATH = $statusPath
           $process = Start-Process $binary.FullName -PassThru
-          Start-Sleep -Seconds 12
-          if ($process.HasExited) { throw 'installed DSHPilot exited before the packaged runtime smoke window' }
-          Stop-Process -Id $process.Id -Force
+          $status = $null
+          for ($attempt = 0; $attempt -lt 60; $attempt++) {
+            if ($process.HasExited) { throw 'installed DSHPilot exited before readiness' }
+            if (Test-Path $statusPath) { try { $status = Get-Content $statusPath -Raw | ConvertFrom-Json } catch {} }
+            if ($null -ne $status -and $status.state -eq 'ready' -and $null -ne $status.url) { break }
+            Start-Sleep -Seconds 1
+          }
+          if ($null -eq $status -or $status.state -ne 'ready' -or $null -eq $status.url) { throw "installed DSHPilot did not report readiness: $status" }
+          $root = Invoke-WebRequest -UseBasicParsing $status.url
+          $health = Invoke-RestMethod -Uri "$($status.url)/__dshpilot/health"
+          if ($root.StatusCode -lt 200 -or $root.StatusCode -ge 300 -or $health.status -ne 'ready') { throw 'installed DSHPilot Harness readiness/health check failed' }
+          $second = Start-Process $binary.FullName -PassThru
+          for ($attempt = 0; $attempt -lt 20 -and -not (Test-Path $handoffPath); $attempt++) { Start-Sleep -Milliseconds 500 }
+          if ($process.HasExited) { throw 'primary DSHPilot exited during single-instance check' }
+          if (-not (Test-Path $handoffPath)) { throw 'single-instance handoff callback was not observed' }
+          if (-not $second.HasExited) { Stop-Process -Id $second.Id -Force -ErrorAction SilentlyContinue; throw 'second DSHPilot process remained alive; single-instance forwarding failed' }
+          if ($second.ExitCode -ne 0) { throw "second DSHPilot launch failed with exit code $($second.ExitCode)" }
+          Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+          Stop-Process -Id $second.Id -Force -ErrorAction SilentlyContinue
       - name: Build Tauri application (macOS bundle)
         if: runner.os != 'Windows'
         run: pnpm tauri build --debug --config apps/desktop/src-tauri/tauri.ci.json
@@ -102,8 +125,31 @@ jobs:
         run: |
           app="$(find apps/desktop/src-tauri/target -path '*/bundle/macos/*.app' -print -quit)"
           test -n "$app"
-          open "$app"
-          for attempt in $(seq 1 24); do pgrep -f 'dshpilot-desktop' >/dev/null && break; sleep 1; done
-          pgrep -f 'dshpilot-desktop' >/dev/null || { echo 'installed macOS bundle did not remain running'; exit 1; }
-          pkill -f 'dshpilot-desktop' || true
+          binary="$(find "$app/Contents/MacOS" -type f -perm -111 -print -quit)"
+          test -n "$binary"
+          status_path="$GITHUB_WORKSPACE/ci-status.json"
+          handoff_path="$GITHUB_WORKSPACE/ci-status.single-instance.json"
+          rm -f "$status_path"
+          rm -f "$handoff_path"
+          DSHPILOT_CI_STATUS_PATH="$status_path" "$binary" >"$GITHUB_WORKSPACE/tauri-ci.log" 2>&1 &
+          pid=$!
+          for attempt in $(seq 1 60); do
+            if ! kill -0 "$pid" 2>/dev/null; then cat "$GITHUB_WORKSPACE/tauri-ci.log"; exit 1; fi
+            if test -s "$status_path" && python3 -c "import json,sys; value=json.load(open(sys.argv[1])); raise SystemExit(0 if value.get('state') == 'ready' and value.get('url') else 1)" "$status_path"; then break; fi
+            sleep 1
+          done
+          test -s "$status_path"
+          url="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['url'])" "$status_path")"
+          curl --fail --silent "$url" >/dev/null
+          curl --fail --silent "$url/__dshpilot/health" | python3 -c "import json,sys; raise SystemExit(0 if json.load(sys.stdin).get('status') == 'ready' else 1)"
+          second_log="$GITHUB_WORKSPACE/tauri-ci-second.log"
+          DSHPILOT_CI_STATUS_PATH="$status_path" "$binary" >"$second_log" 2>&1 &
+          second_pid=$!
+          for attempt in $(seq 1 20); do test -s "$handoff_path" && break; sleep .5; done
+          test -s "$handoff_path"
+          if kill -0 "$second_pid" 2>/dev/null; then kill "$second_pid" || true; cat "$second_log"; echo 'second DSHPilot process remained alive; single-instance forwarding failed'; exit 1; fi
+          wait "$second_pid"; second_code=$?
+          test "$second_code" -eq 0
+          kill "$pid" || true
+          wait "$pid" || true
       - run: pnpm smoke

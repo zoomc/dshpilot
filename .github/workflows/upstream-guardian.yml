@@ -12,6 +12,8 @@ permissions:
 
 jobs:
   guardian:
+    outputs:
+      candidate_sha: ${{ steps.candidate.outputs.sha }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,13 +29,21 @@ jobs:
           cache: pnpm
       - uses: dtolnay/rust-toolchain@stable
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --dir vendor/deepseek-harness install --frozen-lockfile
+      - run: pnpm --dir vendor/deepseek-harness install --frozen-lockfile --ignore-scripts
         env:
           CI: true
+      - name: Resolve and pin upstream candidate
+        id: candidate
+        shell: bash
+        run: |
+          git -C vendor/deepseek-harness fetch --depth=1 origin master
+          echo "sha=$(git -C vendor/deepseek-harness rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
       - name: Run candidate compatibility guardian
         id: guardian
         continue-on-error: true
-        run: set -o pipefail; pnpm guardian -- --promote 2>&1 | tee guardian.log
+        env:
+          DSHPILOT_UPSTREAM_CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+        run: set -o pipefail; pnpm guardian 2>&1 | tee guardian.log
       - name: Publish guardian diagnostics
         if: always()
         run: cat guardian.log >> "$GITHUB_STEP_SUMMARY"
@@ -62,8 +72,151 @@ jobs:
       - name: Fail guardian job when compatibility failed
         if: steps.guardian.outcome == 'failure'
         run: exit 1
+
+  desktop-guardian:
+    needs: guardian
+    if: needs.guardian.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir vendor/deepseek-harness install --frozen-lockfile --ignore-scripts
+        env:
+          CI: true
+      - name: Checkout pinned Harness candidate
+        shell: bash
+        run: |
+          git -C vendor/deepseek-harness fetch --depth=1 origin "${{ needs.guardian.outputs.candidate_sha }}"
+          git -C vendor/deepseek-harness checkout --detach "${{ needs.guardian.outputs.candidate_sha }}"
+      - run: npm --prefix vendor/deepseek-harness run build:lib
+      - run: npm --prefix vendor/deepseek-harness/apps/web run build
+      - run: pnpm run build
+      - run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --target ${{ matrix.target }}
+      - run: pnpm runtime:bundle -- --output artifacts/guardian/runtime
+      - name: Select candidate packaged runtime
+        shell: bash
+        run: |
+          runtime_id="$(node -e "const fs=require('fs'); process.stdout.write(JSON.parse(fs.readFileSync('artifacts/guardian/runtime/current.json','utf8')).runtimeVersion)")"
+          echo "DSHPILOT_RUNTIME_ROOT=$GITHUB_WORKSPACE/artifacts/guardian/runtime/current/versions/$runtime_id" >> "$GITHUB_ENV"
+      - run: pnpm smoke
+      - name: Build candidate Tauri application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pnpm tauri build --debug --bundles nsis --config apps/desktop/src-tauri/tauri.ci.windows.json
+      - name: Build candidate Tauri application
+        if: runner.os == 'macOS'
+        run: pnpm tauri build --debug --config apps/desktop/src-tauri/tauri.ci.json
+      - name: Install and launch candidate Windows application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "apps/desktop/src-tauri/target/debug/bundle/nsis/*.exe" | Select-Object -First 1
+          if ($null -eq $installer) { throw 'candidate NSIS installer was not produced' }
+          Start-Process $installer.FullName -ArgumentList '/S' -Wait
+          $binary = Get-ChildItem "$env:LOCALAPPDATA\DSHPilot" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in @('dshpilot-desktop.exe', 'DSHPilot.exe') } |
+            Select-Object -First 1
+          if ($null -eq $binary) { throw 'candidate install did not produce an application binary' }
+          $statusPath = Join-Path $env:GITHUB_WORKSPACE 'guardian-ci-status.json'
+          $handoffPath = Join-Path $env:GITHUB_WORKSPACE 'guardian-ci-status.single-instance.json'
+          Remove-Item $statusPath, $handoffPath -Force -ErrorAction SilentlyContinue
+          $env:DSHPILOT_CI_STATUS_PATH = $statusPath
+          $process = Start-Process $binary.FullName -PassThru
+          $status = $null
+          for ($attempt = 0; $attempt -lt 60; $attempt++) {
+            if ($process.HasExited) { throw 'candidate installed DSHPilot exited before readiness' }
+            if (Test-Path $statusPath) { try { $status = Get-Content $statusPath -Raw | ConvertFrom-Json } catch {} }
+            if ($null -ne $status -and $status.state -eq 'ready' -and $null -ne $status.url) { break }
+            Start-Sleep -Seconds 1
+          }
+          if ($null -eq $status -or $status.state -ne 'ready' -or $null -eq $status.url) { throw "candidate installed DSHPilot did not report readiness: $status" }
+          Invoke-WebRequest -UseBasicParsing $status.url | Out-Null
+          $health = Invoke-RestMethod -Uri "$($status.url)/__dshpilot/health"
+          if ($health.status -ne 'ready') { throw 'candidate installed Harness health check failed' }
+          $second = Start-Process $binary.FullName -PassThru
+          for ($attempt = 0; $attempt -lt 20 -and -not (Test-Path $handoffPath); $attempt++) { Start-Sleep -Milliseconds 500 }
+          if (-not (Test-Path $handoffPath)) { throw 'candidate single-instance handoff callback was not observed' }
+          if (-not $second.HasExited) { Stop-Process -Id $second.Id -Force -ErrorAction SilentlyContinue; throw 'candidate second instance remained alive' }
+          if ($second.ExitCode -ne 0) { throw "candidate second instance exited with code $($second.ExitCode)" }
+          Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+      - name: Launch candidate macOS application
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app="$(find apps/desktop/src-tauri/target -path '*/bundle/macos/*.app' -print -quit)"
+          test -n "$app"
+          binary="$(find "$app/Contents/MacOS" -type f -perm -111 -print -quit)"
+          test -n "$binary"
+          status_path="$GITHUB_WORKSPACE/guardian-ci-status.json"
+          handoff_path="$GITHUB_WORKSPACE/guardian-ci-status.single-instance.json"
+          rm -f "$status_path" "$handoff_path"
+          DSHPILOT_CI_STATUS_PATH="$status_path" "$binary" >"$GITHUB_WORKSPACE/guardian-tauri-ci.log" 2>&1 &
+          pid=$!
+          for attempt in $(seq 1 60); do
+            kill -0 "$pid" 2>/dev/null || { cat "$GITHUB_WORKSPACE/guardian-tauri-ci.log"; exit 1; }
+            if test -s "$status_path" && python3 -c "import json,sys; value=json.load(open(sys.argv[1])); raise SystemExit(0 if value.get('state') == 'ready' and value.get('url') else 1)" "$status_path"; then break; fi
+            sleep 1
+          done
+          test -s "$status_path"
+          url="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['url'])" "$status_path")"
+          curl --fail --silent "$url" >/dev/null
+          curl --fail --silent "$url/__dshpilot/health" | python3 -c "import json,sys; raise SystemExit(0 if json.load(sys.stdin).get('status') == 'ready' else 1)"
+          DSHPILOT_CI_STATUS_PATH="$status_path" "$binary" >"$GITHUB_WORKSPACE/guardian-tauri-second.log" 2>&1 &
+          second_pid=$!
+          for attempt in $(seq 1 20); do test -s "$handoff_path" && break; sleep .5; done
+          test -s "$handoff_path"
+          if kill -0 "$second_pid" 2>/dev/null; then kill "$second_pid" || true; cat "$GITHUB_WORKSPACE/guardian-tauri-second.log"; exit 1; fi
+          wait "$second_pid"
+          test "$?" -eq 0
+          kill "$pid" || true
+          wait "$pid" || true
+
+  promote:
+    needs: [guardian, desktop-guardian]
+    if: needs.guardian.result == 'success' && needs.desktop-guardian.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir vendor/deepseek-harness install --frozen-lockfile --ignore-scripts
+        env:
+          CI: true
+      - name: Re-run tested promotion gate and update stable manifest
+        run: pnpm guardian -- --promote
+        env:
+          DSHPILOT_UPSTREAM_CANDIDATE_SHA: ${{ needs.guardian.outputs.candidate_sha }}
       - name: Create candidate update PR
-        if: steps.guardian.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -82,4 +235,4 @@ jobs:
             --base main \
             --head "$branch" \
             --title "chore: promote tested Harness upstream candidate" \
-            --body "Generated by the Upstream Guardian after build, typecheck, unit, Web smoke, plugin loading, and runtime bundle checks passed."
+            --body "Generated by the Upstream Guardian after Linux, Windows, and macOS build, typecheck, Web smoke, plugin loading, Tauri build, and runtime checks passed."

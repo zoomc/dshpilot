@@ -10,7 +10,8 @@ const execFileAsync = promisify(execFile)
 const ARTIFACT_ID = /^sha256:[a-f0-9]{64}$/u
 
 export interface ArtifactManifest { artifactId: string; name: string; mediaType: string; bytes: number; sha256: string; createdAt: string; readonly: true }
-export interface ResourceReference { resourceId: string; kind: 'file' | 'folder' | 'git' | 'github-pr' | 'github-issue' | 'url'; label: string; locator: string; createdAt: string }
+export interface ResourceReference { resourceId: string; kind: 'file' | 'folder' | 'git' | 'github-repository' | 'github-pr' | 'github-issue' | 'url'; label: string; locator: string; createdAt: string }
+export type ResourceOperation = 'inspect' | 'tree' | 'search' | 'read' | 'diff' | 'history'
 export interface SessionLineage { sessionId: string; parentSessionId?: string; rootSessionId: string; createdAt: string }
 
 function digest(data: Uint8Array): string { return createHash('sha256').update(data).digest('hex') }
@@ -34,6 +35,19 @@ export class ArtifactStore {
   async read(artifactId: string, maxBytes = 100 * 1024 * 1024): Promise<Uint8Array> { const sha256 = safeArtifact(artifactId); const path = join(this.root, 'objects', sha256.slice(0, 2), sha256); const info = await stat(path); if (info.size > maxBytes) throw new Error('artifact exceeds read limit'); const data = new Uint8Array(await readFile(path)); if (data.byteLength > maxBytes || digest(data) !== sha256) throw new Error('artifact integrity or size check failed'); return data }
   async saveAs(artifactId: string, destination: string): Promise<string> { const target = resolve(destination); await mkdir(dirname(target), { recursive: true }); await writeFile(target, await this.read(artifactId)); return target }
   reveal(artifactId: string): string { const sha256 = safeArtifact(artifactId); return join(this.root, 'objects', sha256.slice(0, 2), sha256) }
+  async open(artifactId: string): Promise<{ opened: boolean }> {
+    const target = this.reveal(artifactId)
+    await stat(target)
+    const command = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer.exe' : 'xdg-open'
+    try { await execFileAsync(command, [target], { timeout: 15_000 }); return { opened: true } } catch { return { opened: false } }
+  }
+  async revealInFileManager(artifactId: string): Promise<{ opened: boolean }> {
+    const target = this.reveal(artifactId)
+    await stat(target)
+    const command = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer.exe' : 'xdg-open'
+    const args = process.platform === 'darwin' ? ['-R', target] : process.platform === 'win32' ? [`/select,${target}`] : [dirname(target)]
+    try { await execFileAsync(command, args, { timeout: 15_000 }); return { opened: true } } catch { return { opened: false } }
+  }
 }
 
 async function git(cwd: string, args: string[], timeoutMs = 15_000): Promise<string> {
@@ -46,14 +60,26 @@ export class GitPresentation {
   private async cwd(value: string): Promise<string> { const root = await realpath(this.workspaceRoot); const resolved = await realpath(resolve(value)); if (!isPathInside(root, resolved)) throw new Error('git workspace is outside the trusted root'); return resolved }
   async status(cwd: string): Promise<string> { return git(await this.cwd(cwd), ['status', '--short']) }
   async diff(cwd: string, path?: string): Promise<string> { const worktree = await this.cwd(cwd); const args = ['diff', '--no-ext-diff']; if (path !== undefined) { const safe = resolve(worktree, path); if (!isPathInside(worktree, safe)) throw new Error('git diff path is outside the workspace'); const parent = await realpath(dirname(safe)); if (!isPathInside(worktree, parent)) throw new Error('git diff path escapes the workspace'); try { if (!isPathInside(worktree, await realpath(safe))) throw new Error('git diff path symlink escapes the workspace') } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error } args.push('--', relative(worktree, safe)) } return git(worktree, args) }
-  async summary(cwd: string, path?: string): Promise<{ branch: string; status: string; diff: string; commit: string }> { const worktree = await this.cwd(cwd); return { branch: (await git(worktree, ['branch', '--show-current'])).trim(), status: await git(worktree, ['status', '--short']), diff: await this.diff(worktree, path), commit: (await git(worktree, ['log', '-1', '--format=%h %s'])).trim() } }
+  async summary(cwd: string, path?: string): Promise<{ branch: string; status: string; staged: string[]; unstaged: string[]; changedFiles: string[]; diff: string; commit: string }> {
+    const worktree = await this.cwd(cwd); const status = await git(worktree, ['status', '--short']); const lines = status.split('\n').filter(Boolean)
+    return {
+      branch: (await git(worktree, ['branch', '--show-current'])).trim(), status,
+      staged: lines.filter(line => line[0] !== ' ' && line[0] !== '?').map(line => line.slice(3)),
+      unstaged: lines.filter(line => line[1] !== ' ' && line[1] !== '?').map(line => line.slice(3)),
+      changedFiles: lines.map(line => line.slice(3)), diff: await this.diff(worktree, path), commit: (await git(worktree, ['log', '-1', '--format=%h %s'])).trim(),
+    }
+  }
 }
 
 export class ResourceProviderRegistry {
-  private readonly providers = new Map<string, (resource: ResourceReference) => Promise<unknown>>()
-  register(kind: ResourceReference['kind'], provider: (resource: ResourceReference) => Promise<unknown>): () => void { if (this.providers.has(kind)) throw new Error(`resource provider already registered: ${kind}`); this.providers.set(kind, provider); return () => this.providers.delete(kind) }
+  private readonly providers = new Map<string, (resource: ResourceReference, operation: ResourceOperation, input?: Record<string, unknown>) => Promise<unknown>>()
+  register(kind: ResourceReference['kind'], provider: (resource: ResourceReference, operation?: ResourceOperation, input?: Record<string, unknown>) => Promise<unknown>): () => void {
+    if (this.providers.has(kind)) throw new Error(`resource provider already registered: ${kind}`)
+    this.providers.set(kind, (resource, operation, input) => provider(resource, operation, input))
+    return () => this.providers.delete(kind)
+  }
   list(): string[] { return [...this.providers.keys()].sort() }
-  resolve(resource: ResourceReference): Promise<unknown> { const provider = this.providers.get(resource.kind); if (provider === undefined) throw new Error(`resource provider is unavailable: ${resource.kind}`); return provider(resource) }
+  resolve(resource: ResourceReference, operation: ResourceOperation = 'inspect', input?: Record<string, unknown>): Promise<unknown> { const provider = this.providers.get(resource.kind); if (provider === undefined) throw new Error(`resource provider is unavailable: ${resource.kind}`); return provider(resource, operation, input) }
 }
 
 export class SessionLineageStore {

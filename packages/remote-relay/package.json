@@ -1,0 +1,12 @@
+{
+  "name": "@dshpilot/remote-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "bin": { "dshpilot-relay": "lib/bin.js" },
+  "scripts": { "build": "tsc -p tsconfig.json", "typecheck": "tsc -p tsconfig.json --noEmit", "test": "vitest --root ../.. run packages/remote-relay/src/index.test.ts" },
+  "dependencies": { "ws": "^8.21.3" },
+  "devDependencies": { "@types/ws": "^8.18.1" }
+}

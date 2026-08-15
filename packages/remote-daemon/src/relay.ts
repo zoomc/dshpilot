@@ -280,7 +280,6 @@ interface RelayPeer {
 
 export class RelayRouter {
   private readonly sessions = new Map<string, Map<string, RelayPeer>>()
-  private readonly sequences = new Map<string, RelayReplayGuard>()
   constructor(private readonly trustedIdentityPublicKey?: string) {}
 
   register(sessionId: string, connectionId: string, sink: (frame: Uint8Array) => void): () => void {
@@ -296,7 +295,6 @@ export class RelayRouter {
     const peers = this.sessions.get(sessionId) ?? new Map<string, RelayPeer>()
     if ([...peers.values()].some(peer => peer.role === handshake.role)) throw new Error('relay role is already connected for this session')
     peers.set(connectionId, { sink, role: handshake.role, deviceId: handshake.deviceId, identityPublicKey: handshake.identityPublicKey }); this.sessions.set(sessionId, peers)
-    this.sequences.set(sessionId, this.sequences.get(sessionId) ?? new RelayReplayGuard())
     return () => this.unregister(sessionId, connectionId)
   }
 
@@ -307,16 +305,18 @@ export class RelayRouter {
     return delivered
   }
 
-  forwardAuthenticated(sessionId: string, senderId: string, frame: EncryptedRelayFrame, encoded = Buffer.from(JSON.stringify(frame))): number {
+  forwardAuthenticated(sessionId: string, senderId: string, frame: EncryptedRelayFrame, encoded: Uint8Array = Buffer.from(JSON.stringify(frame))): number {
     assertEncryptedRelayFrame(frame)
     const peers = this.sessions.get(sessionId)
     const sender = peers?.get(senderId)
     if (peers === undefined || sender === undefined || sender.role === undefined) throw new Error('relay connection is not authenticated')
     const expectedDirection = sender.role === 'client' ? 'client_to_server' : 'server_to_client'
     if (frame.direction !== expectedDirection) throw new Error('relay frame direction is not authorized')
-    const guard = this.sequences.get(sessionId) ?? new RelayReplayGuard()
-    guard.accept(sessionId, frame.direction, frame.frameSeq)
-    this.sequences.set(sessionId, guard)
+    // This router is intentionally blind: it cannot authenticate the AEAD
+    // ciphertext, so advancing a replay window here would let a forged packet
+    // consume the sequence number of the real packet. The receiving endpoint
+    // must call decryptRelayFrame(), which authenticates before advancing its
+    // RelayReplayGuard.
     let delivered = 0
     for (const [connectionId, peer] of peers) { if (connectionId === senderId) continue; peer.sink(encoded); delivered += 1 }
     return delivered
@@ -325,7 +325,7 @@ export class RelayRouter {
   private unregister(sessionId: string, connectionId: string): void {
     const peers = this.sessions.get(sessionId); if (peers === undefined) return
     peers.delete(connectionId)
-    if (peers.size === 0) { this.sessions.delete(sessionId); this.sequences.delete(sessionId) }
+    if (peers.size === 0) this.sessions.delete(sessionId)
   }
 }
 

@@ -8,12 +8,12 @@
   "packageManager": "pnpm@11.7.0",
   "scripts": {
     "build": "pnpm run build:packages && pnpm run build:web && pnpm run build:remote-pwa",
-    "build:packages": "pnpm --filter @dshpilot/control-contracts build && pnpm --filter @dshpilot/desktop-host build && pnpm --filter @dshpilot/dsh-plugin-desktop build && pnpm --filter @dshpilot/dsh-client-desktop build && pnpm --filter @dshpilot/remote-daemon build && pnpm --filter @dshpilot/remote-client build",
+    "build:packages": "pnpm --filter @dshpilot/control-contracts build && pnpm --filter @dshpilot/desktop-host build && pnpm --filter @dshpilot/dsh-plugin-desktop build && pnpm --filter @dshpilot/dsh-client-desktop build && pnpm --filter @dshpilot/remote-daemon build && pnpm --filter @dshpilot/remote-client build && pnpm --filter @dshpilot/remote-relay build",
     "build:web": "vite build --config apps/desktop/vite.config.ts",
     "dev:web": "vite --config apps/desktop/vite.config.ts",
     "lint": "eslint . --ignore-pattern vendor --ignore-pattern node_modules",
     "build:remote-pwa": "pnpm --filter @dshpilot/remote-pwa build",
-    "typecheck": "pnpm --filter @dshpilot/control-contracts typecheck && pnpm --filter @dshpilot/desktop-host typecheck && pnpm --filter @dshpilot/dsh-plugin-desktop typecheck && pnpm --filter @dshpilot/dsh-client-desktop typecheck && pnpm --filter @dshpilot/remote-daemon typecheck && pnpm --filter @dshpilot/remote-client typecheck && pnpm --filter @dshpilot/remote-pwa exec tsc -p tsconfig.json --noEmit && pnpm --filter @dshpilot/desktop typecheck && pnpm run typecheck:scripts",
+    "typecheck": "pnpm --filter @dshpilot/control-contracts typecheck && pnpm --filter @dshpilot/desktop-host typecheck && pnpm --filter @dshpilot/dsh-plugin-desktop typecheck && pnpm --filter @dshpilot/dsh-client-desktop typecheck && pnpm --filter @dshpilot/remote-daemon typecheck && pnpm --filter @dshpilot/remote-client typecheck && pnpm --filter @dshpilot/remote-relay typecheck && pnpm --filter @dshpilot/remote-pwa exec tsc -p tsconfig.json --noEmit && pnpm --filter @dshpilot/desktop typecheck && pnpm run typecheck:scripts",
     "typecheck:scripts": "tsc -p tsconfig.scripts.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -21,7 +21,8 @@
     "runtime:bundle": "tsx scripts/runtime/index.ts",
     "guardian": "tsx scripts/guardian/index.ts",
     "smoke": "tsx scripts/smoke/index.ts",
-    "remote:serve": "tsx scripts/remote/index.ts"
+    "remote:serve": "tsx scripts/remote/index.ts",
+    "relay:serve": "pnpm --filter @dshpilot/remote-relay build && node packages/remote-relay/lib/bin.js"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.5.0",

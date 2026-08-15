@@ -11,7 +11,7 @@ type FailureClass = 'UPSTREAM_BUILD_BREAK' | 'CLIENT_SLOT_BREAK' | 'CLIENT_PLUGI
 
 function classify(output: string, stage: string): FailureClass {
   const text = `${stage}\n${output}`.toLowerCase()
-  if (stage === 'upstream-build') return 'UPSTREAM_BUILD_BREAK'
+  if (stage.startsWith('upstream-build')) return 'UPSTREAM_BUILD_BREAK'
   if (text.includes('ui-slot') || text.includes('ui slot')) return 'CLIENT_SLOT_BREAK'
   if (text.includes('client plugin') || text.includes('dsh-client-')) return 'CLIENT_PLUGIN_API_BREAK'
   if (text.includes('host plugin') || text.includes('dsh-host-')) return 'HOST_PLUGIN_API_BREAK'
@@ -49,9 +49,14 @@ async function main(): Promise<void> {
   }
   const candidateVersion = JSON.parse(await readFile(join(harnessRoot, 'apps/cli/package.json'), 'utf8')).version as string
   const steps = [
-    ['upstream-build', 'pnpm', ['run', 'typecheck'], harnessRoot],
-    ['upstream-build', 'pnpm', ['run', 'build'], harnessRoot],
-    ['harness-config', 'pnpm', ['exec', 'dsh', '--dump-config'], harnessRoot],
+    // The vendored Harness postinstall installs worktree-local lefthook config.
+    // A submodule's common Git config cannot accept that mutation, so CI uses
+    // npm's direct script/bin entry points after installing the vendor with
+    // --ignore-scripts. This keeps upstream source untouched and reproducible.
+    ['upstream-build', 'npm', ['run', 'typecheck'], harnessRoot],
+    ['upstream-build', 'npm', ['run', 'build:lib'], harnessRoot],
+    ['upstream-build-web', 'npm', ['--prefix', 'apps/web', 'run', 'build'], harnessRoot],
+    ['harness-config', 'node', ['apps/cli/lib/bin.js', '--profile', 'web', '--dump-config'], harnessRoot],
     ['typecheck', 'pnpm', ['run', 'typecheck'], projectRoot],
     ['build', 'pnpm', ['run', 'build'], projectRoot],
     ['unit', 'pnpm', ['test'], projectRoot],

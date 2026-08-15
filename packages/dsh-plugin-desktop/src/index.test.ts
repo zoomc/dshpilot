@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { LocalDocumentProvider, McpManager } from '@dshpilot/desktop-host'
-import { apply, liveMcpRecords, reconcileMcpLoader } from './index.js'
+import { apply, liveMcpRecords, projectHarnessEvent, reconcileMcpLoader, restartMcpLoader } from './index.js'
 
 interface FixtureEntry {
   id: string
@@ -46,7 +46,7 @@ describe('DSHPilot Host plugin document tool seam', () => {
         webServer: { register() { return () => undefined } },
         effect(callback) { callback() },
       })
-      expect(definitions.map(value => value.name)).toEqual(['document_inspect', 'document_read', 'document_search', 'spreadsheet_sheet_info', 'spreadsheet_read_range', 'presentation_slide'])
+      expect(definitions.map(value => value.name)).toEqual(['document_inspect', 'document_read', 'document_search', 'spreadsheet_sheet_info', 'spreadsheet_read_range', 'presentation_slide', 'resource_inspect', 'resource_tree', 'resource_search', 'resource_read', 'resource_diff', 'resource_history'])
       const search = definitions.find(value => value.name === 'document_search')!
       const result = await (search.execute as (args: unknown, exec: { signal: AbortSignal }) => Promise<unknown>)({ attachmentId: manifest.attachmentId, query: 'beta' }, { signal: new AbortController().signal })
       expect(result).toMatchObject({ matches: [{ line: 2, text: 'beta' }] })
@@ -80,7 +80,7 @@ describe('DSHPilot Host plugin document tool seam', () => {
       expect(loader.entries()).toHaveLength(1)
       expect((loader.entries()[0]!.options.config as { env: Record<string, string> }).env).toEqual({ MCP_TOKEN: 'fixture-secret' })
       expect(await readFile(manager.statePath, 'utf8')).not.toContain('fixture-secret')
-      expect(definitions).toHaveLength(6)
+      expect(definitions).toHaveLength(12)
 
       const records = await manager.list()
       expect(liveMcpRecords({ loader, tools: { register: () => () => undefined, schemas: () => [{ name: 'mcp__fixture_server__search' }] } }, records)[0]).toMatchObject({
@@ -88,9 +88,17 @@ describe('DSHPilot Host plugin document tool seam', () => {
       })
       expect((await reconcileMcpLoader({ loader, credentials }, records)).reloaded).toBe(false)
       expect(loader.updates).toBe(0)
+      expect(await restartMcpLoader({ loader, credentials }, records[0]!)).toEqual({ restarted: true, managedEntries: 1 })
+      expect(loader.updates).toBe(2)
     } finally {
       if (previous === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previous
     }
+  })
+
+  it('projects bounded redacted assistant output for the remote Task Center', () => {
+    const event = projectHarnessEvent({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'answer sk-test-secret-1234567890 token=hidden-value' }] } } })
+    expect(event).toMatchObject({ kind: 'assistant/message', text: expect.stringContaining('[redacted-secret]') })
+    expect(event.text).not.toContain('hidden-value')
   })
 })

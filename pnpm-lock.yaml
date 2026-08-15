@@ -141,6 +141,16 @@ importers:
         specifier: ^8.18.1
         version: 8.18.1
 
+  packages/remote-relay:
+    dependencies:
+      ws:
+        specifier: ^8.21.3
+        version: 8.21.3
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.1
+
 packages:
 
   '@babel/code-frame@7.29.7':

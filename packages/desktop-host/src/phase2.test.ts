@@ -48,6 +48,18 @@ describe('MCP manager and import', () => {
     await expect(resolveOfficialMcpPluginConfig(record, { resolve: async () => undefined })).rejects.toThrow('credential reference')
   })
 
+  it('never carries token-shaped values from arguments or ordinary environment keys', () => {
+    const preview = parseMcpImport(JSON.stringify({ mcpServers: { unsafe: { command: 'fixture', args: ['--token', 'sk-live-secret-1234567890'], env: { FOO: 'ghp_example-secret-1234567890' } } } }), 'claude.json')
+    expect(preview.warnings.length).toBeGreaterThanOrEqual(2)
+    expect(JSON.stringify(preview.servers)).not.toMatch(/sk-live-secret|ghp_example-secret/u)
+    expect(renderMcpPatch(preview.servers)).not.toMatch(/sk-live-secret|ghp_example-secret/u)
+  })
+
+  it('recognizes Cursor-shaped imports when the source identifies Cursor', () => {
+    const preview = parseMcpImport(JSON.stringify({ mcpServers: { cursor: { command: 'cursor-mcp' } } }), 'cursor.json')
+    expect(preview.format).toBe('cursor')
+  })
+
   it('requires explicit confirmation before import and persists the overlay atomically', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dshpilot-mcp-'))
     const manager = new McpManager(root)

@@ -36,10 +36,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --dir vendor/deepseek-harness install --frozen-lockfile
+      - run: pnpm --dir vendor/deepseek-harness install --frozen-lockfile --ignore-scripts
         env:
           CI: true
-      - run: pnpm --dir vendor/deepseek-harness run build
+      - run: npm --prefix vendor/deepseek-harness run build:lib
+      - run: npm --prefix vendor/deepseek-harness/apps/web run build
       - run: pnpm run build
       - run: pnpm run typecheck
       - run: pnpm test

@@ -1251,8 +1251,22 @@ fn runtime_rollback(
     let result = run_runtime_tool(&paths, &["--rollback".into()], "current.json");
     match result {
         Ok(output) => {
-            start_harness(&app, &state, &status)?;
-            Ok(output)
+            match start_harness(&app, &state, &status) {
+                Ok(_) => Ok(output),
+                Err(start_error) => {
+                    // The runtime CLI has already smoke-tested the target, but
+                    // the real desktop launch can still fail (WebView, profile
+                    // patch, or OS process policy). Restore the prior pointer
+                    // and give the desktop one last known-good start attempt.
+                    match run_runtime_tool(&paths, &["--rollback".into()], "current.json") {
+                        Ok(restored) => match start_harness(&app, &state, &status) {
+                            Ok(_) => Err(format!("Runtime rollback launched unsuccessfully: {start_error}; restored prior Runtime: {restored}")),
+                            Err(recovery_error) => Err(format!("Runtime rollback failed to launch: {start_error}; prior Runtime recovery also failed: {recovery_error}")),
+                        },
+                        Err(recovery_error) => Err(format!("Runtime rollback failed to launch: {start_error}; restoring prior Runtime failed: {recovery_error}")),
+                    }
+                }
+            }
         }
         Err(error) => {
             let _ = start_harness(&app, &state, &status);
@@ -1413,19 +1427,44 @@ fn monitor_notifications(app: AppHandle, path: PathBuf) {
 }
 
 fn monitor_tray_status(app: AppHandle, status: Arc<Mutex<SupervisorStatus>>) {
+    let status_path = env::var_os("DSHPILOT_CI_STATUS_PATH").map(PathBuf::from);
     thread::spawn(move || loop {
         if let Ok(snapshot) = status.lock() {
             if let Some(tray) = app.tray_by_id("dshpilot-tray") {
                 let _ = tray.set_tooltip(Some(format!("DSHPilot — {}", snapshot.state)));
+            }
+            if let Some(path) = status_path.as_ref() {
+                if let Ok(value) = serde_json::to_vec(&*snapshot) {
+                    if let Some(parent) = path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+                    if fs::write(&temporary, value).is_ok() {
+                        if fs::rename(&temporary, path).is_err() {
+                            let _ = fs::remove_file(path);
+                            let _ = fs::rename(&temporary, path);
+                        }
+                    }
+                }
             }
         }
         thread::sleep(Duration::from_millis(500));
     });
 }
 
+fn record_single_instance_handoff(argv: &[String], cwd: &str) {
+    let Some(status_path) = env::var_os("DSHPILOT_CI_STATUS_PATH").map(PathBuf::from) else {
+        return;
+    };
+    let marker = status_path.with_extension("single-instance.json");
+    let value = serde_json::json!({ "argv": argv, "cwd": cwd });
+    let _ = fs::write(marker, value.to_string());
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            record_single_instance_handoff(&argv, &cwd);
             let _ = app.emit(
                 "dshpilot://open",
                 serde_json::json!({ "argv": argv, "cwd": cwd }),
