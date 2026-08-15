@@ -6,6 +6,8 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: 'dist',
-    emptyOutDir: true,
+    // Do not empty the output dir on each build. The sandbox build runner guards
+    // bulk deletes, so clearing the dir here would block incremental rebuilds.
+    emptyOutDir: false,
   },
 })
