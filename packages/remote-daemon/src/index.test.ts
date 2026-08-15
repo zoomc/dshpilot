@@ -55,14 +55,16 @@ describe('control plane', () => {
   })
 
   it('fails cleanly when the control port is already occupied', async () => {
-    const first = new ControlPlaneServer({ version: '0.1.0', remoteEnabled: true }); const address = await first.start()
-    const second = new ControlPlaneServer({ version: '0.1.0', remoteEnabled: true, host: address.host, port: address.port })
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-port-'))
+    const first = new ControlPlaneServer({ version: '0.1.0', remoteEnabled: true, devicesPath: join(root, 'devices.json') }); const address = await first.start()
+    const second = new ControlPlaneServer({ version: '0.1.0', remoteEnabled: true, host: address.host, port: address.port, devicesPath: join(root, 'devices-b.json') })
     await expect(second.start()).rejects.toThrow()
     await first.stop()
   })
 
   it('rejects hostile Host and Origin headers before serving the control plane', async () => {
-    const server = new ControlPlaneServer({ version: '0.1.0', remoteEnabled: true })
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-hostile-'))
+    const server = new ControlPlaneServer({ version: '0.1.0', remoteEnabled: true, devicesPath: join(root, 'devices.json') })
     const address = await server.start(); const base = `http://${address.host}:${address.port}`
     const hostileHost = await new Promise<number>((resolveStatus, reject) => { const request = httpRequest({ hostname: address.host, port: address.port, path: '/health', headers: { host: `evil.example:${address.port}` } }, response => { response.resume(); response.once('end', () => resolveStatus(response.statusCode ?? 0)) }); request.once('error', reject); request.end() })
     expect(hostileHost).toBe(400)
@@ -102,8 +104,9 @@ describe('control plane', () => {
   })
 
   it('exposes artifact open/reveal actions and provider-backed resource reads', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-artifact-'))
     const server = new ControlPlaneServer({
-      version: '0.1.0', remoteEnabled: true,
+      version: '0.1.0', remoteEnabled: true, devicesPath: join(root, 'devices.json'),
       adapter: {
         artifacts: async () => [{ artifactId: 'sha256:' + '1'.repeat(64), name: 'file.txt', bytes: 1 }],
         artifactRead: async () => new Uint8Array([1]),
@@ -142,7 +145,8 @@ describe('control plane', () => {
   })
 
   it('rejects relay payloads that are not encrypted frame envelopes', async () => {
-    const server = new ControlPlaneServer({ version: '0.1.0', remoteEnabled: true, relayEnabled: true })
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-relay-invalid-'))
+    const server = new ControlPlaneServer({ version: '0.1.0', remoteEnabled: true, relayEnabled: true, devicesPath: join(root, 'devices.json') })
     const address = await server.start(); const offer = server.devices.createOffer(); const identity = createRelayIdentity()
     const pairResponse = await fetch(`http://${address.host}:${address.port}/v1/pair`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: offer.code, name: 'relay validation', offerId: offer.offerId, serverId: offer.serverId, serverPublicKey: offer.publicKey, identityPublicKey: identity.publicKey, pairingProof: signPairingProof(identity, { serverId: offer.serverId, serverPublicKey: offer.publicKey, offerId: offer.offerId, nonce: offer.nonce }) }) })
     const paired = (await pairResponse.json() as { value: { token: string; device: { deviceId: string } } }).value
@@ -153,6 +157,125 @@ describe('control plane', () => {
     socket.send(JSON.stringify({ sessionId: session.sessionId, direction: 'client_to_server', frameSeq: 1, plaintext: 'must not be relayed' }))
     await new Promise<void>((resolveClose, rejectClose) => { socket.once('close', () => resolveClose()); socket.once('error', rejectClose) })
     await server.stop()
+  })
+
+  it('scopes paired devices to the workspaces carried by their one-time offer', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-wsscope-'))
+    const server = new ControlPlaneServer({
+      version: '0.1.0', remoteEnabled: true, workspaceIds: ['ws-a'], allowLocalPairingOffer: true, devicesPath: join(root, 'devices.json'),
+      adapter: {
+        sessions: async () => [{ sessionId: 'session-a', workspaceId: 'ws-a', status: 'idle', updatedAt: new Date().toISOString() }, { sessionId: 'session-b', workspaceId: 'ws-b', status: 'idle', updatedAt: new Date().toISOString() }],
+        tasks: async () => [{ taskId: 'task-a', workspaceId: 'ws-a', status: 'completed', updatedAt: new Date().toISOString() }, { taskId: 'task-b', workspaceId: 'ws-b', status: 'completed', updatedAt: new Date().toISOString() }],
+      },
+    })
+    const address = await server.start(); const base = `http://${address.host}:${address.port}`; const offer = server.devices.createOffer(120_000, ['ws-a'])
+    const paired = (await (await fetch(`${base}/v1/pair`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: offer.code, name: 'scoped device' }) })).json() as { value: { token: string; device: { workspaceIds?: string[] } } }).value
+    expect(paired.device.workspaceIds).toEqual(['ws-a'])
+    const headers = { authorization: `Bearer ${paired.token}` }
+    expect((await (await fetch(`${base}/v1/sessions`, { headers })).json() as { value: Array<{ sessionId: string }> }).value.map(item => item.sessionId)).toEqual(['session-a'])
+    expect((await (await fetch(`${base}/v1/tasks`, { headers })).json() as { value: Array<{ taskId: string }> }).value.map(item => item.taskId)).toEqual(['task-a'])
+    const forbidden = await fetch(`${base}/v1/control`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'prompt_admission', requestId: 'workspace-denied', workspaceId: 'ws-b', input: 'must fail' }) })
+    expect(forbidden.status).toBe(401)
+    await server.stop()
+  })
+
+  it('rejects cross-workspace reads for a device paired to a single workspace', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-scope-'))
+    const server = new ControlPlaneServer({
+      version: '0.1.0', remoteEnabled: true, devicesPath: join(root, 'devices.json'), allowLocalPairingOffer: true,
+      adapter: {
+        questions: async () => [
+          { id: 'q-a', question: 'a', workspaceId: 'ws-a' },
+          { id: 'q-b', question: 'b', workspaceId: 'ws-b' },
+        ],
+        artifacts: async () => [
+          { artifactId: 'art-a', name: 'a', workspaceId: 'ws-a' },
+          { artifactId: 'art-b', name: 'b', workspaceId: 'ws-b' },
+        ],
+        resources: async () => [
+          { resourceId: 'res-a', workspaceId: 'ws-a' },
+          { resourceId: 'res-b', workspaceId: 'ws-b' },
+        ],
+      },
+    })
+    const address = await server.start(); const base = `http://${address.host}:${address.port}`
+    const offer = server.devices.createOffer(120_000, ['ws-a'])
+    const paired = (await (await fetch(`${base}/v1/pair`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: offer.code, name: 'workspace-a device' }) })).json() as { value: { token: string } }).value
+    const headers = { authorization: `Bearer ${paired.token}` }
+    const questions = (await (await fetch(`${base}/v1/questions`, { headers })).json() as { value: Array<{ id: string }> }).value
+    expect(questions.map(item => item.id)).toEqual(['q-a'])
+    const artifacts = (await (await fetch(`${base}/v1/artifacts`, { headers })).json() as { value: Array<{ artifactId: string }> }).value
+    expect(artifacts.map(item => item.artifactId)).toEqual(['art-a'])
+    const resources = (await (await fetch(`${base}/v1/resources`, { headers })).json() as { value: Array<{ resourceId: string }> }).value
+    expect(resources.map(item => item.resourceId)).toEqual(['res-a'])
+    // Explicitly requesting a workspace the device is not paired for is denied.
+    expect((await fetch(`${base}/v1/questions?workspaceId=ws-b`, { headers })).status).toBe(401)
+    expect((await fetch(`${base}/v1/artifacts?workspaceId=ws-b`, { headers })).status).toBe(401)
+    expect((await fetch(`${base}/v1/resources?workspaceId=ws-b`, { headers })).status).toBe(401)
+    expect((await fetch(`${base}/v1/events?workspaceId=ws-b`, { headers })).status).toBe(401)
+    expect((await fetch(`${base}/v1/artifacts/art-b?workspaceId=ws-b`, { headers })).status).toBe(401)
+    expect((await fetch(`${base}/v1/resources/res-b?workspaceId=ws-b`, { headers })).status).toBe(401)
+    // The device's own workspace remains reachable through the explicit selector.
+    expect((await fetch(`${base}/v1/questions?workspaceId=ws-a`, { headers })).status).toBe(200)
+    await server.stop()
+  })
+
+  it('scopes event and get-by-id routes to the paired workspace when no explicit selector is supplied', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-scope-default-'))
+    const server = new ControlPlaneServer({
+      version: '0.1.0', remoteEnabled: true, devicesPath: join(root, 'devices.json'), allowLocalPairingOffer: true,
+      adapter: {
+        sessions: async () => [{ sessionId: 'session-a', workspaceId: 'ws-a', status: 'idle', updatedAt: new Date().toISOString() }, { sessionId: 'session-b', workspaceId: 'ws-b', status: 'idle', updatedAt: new Date().toISOString() }],
+        artifacts: async () => [{ artifactId: 'art-a', name: 'a', workspaceId: 'ws-a' }, { artifactId: 'art-b', name: 'b', workspaceId: 'ws-b' }],
+        artifactRead: async () => new Uint8Array([1]),
+        resources: async () => [{ resourceId: 'res-a', workspaceId: 'ws-a' }, { resourceId: 'res-b', workspaceId: 'ws-b' }],
+        resourceResolve: async (resourceId, operation, input) => ({ resourceId, operation, input }),
+      },
+    })
+    const address = await server.start(); const base = `http://${address.host}:${address.port}`
+    server.events.append('task.updated', { sessionId: 'session-a', jobs: [{ id: 'j-a', kind: 'session.prompt', status: 'running' }] })
+    server.events.append('task.updated', { sessionId: 'session-b', jobs: [{ id: 'j-b', kind: 'session.prompt', status: 'running' }] })
+    const offer = server.devices.createOffer(120_000, ['ws-a'])
+    const paired = (await (await fetch(`${base}/v1/pair`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: offer.code, name: 'workspace-a device' }) })).json() as { value: { token: string } }).value
+    const headers = { authorization: `Bearer ${paired.token}` }
+    // Events without an explicit workspaceId must be scoped to the device's paired workspace.
+    const events = (await (await fetch(`${base}/v1/events`, { headers })).json()) as { value: { events: Array<Record<string, unknown>> } }
+    expect(events.value.events.some(event => (event.payload as Record<string, unknown> | undefined)?.sessionId === 'session-b')).toBe(false)
+    expect(events.value.events.some(event => (event.payload as Record<string, unknown> | undefined)?.sessionId === 'session-a')).toBe(true)
+    // Cross-workspace get-by-id without an explicit selector is denied.
+    expect((await fetch(`${base}/v1/artifacts/art-b`, { headers })).status).toBe(401)
+    expect((await fetch(`${base}/v1/resources/res-b`, { headers })).status).toBe(401)
+    // The device's own workspace remains reachable without an explicit selector.
+    expect((await fetch(`${base}/v1/artifacts/art-a`, { headers })).status).toBe(200)
+    expect((await fetch(`${base}/v1/resources/res-a`, { headers })).status).toBe(200)
+    // The control-protocol `events` request kind is scoped the same way (no bypass via POST /v1/control).
+    const controlEvents = (await (await fetch(`${base}/v1/control`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'events', after: 0, limit: 500 }) })).json()) as { value: Array<Record<string, unknown>> }
+    expect(controlEvents.value.some(event => (event.payload as Record<string, unknown> | undefined)?.sessionId === 'session-b')).toBe(false)
+    expect(controlEvents.value.some(event => (event.payload as Record<string, unknown> | undefined)?.sessionId === 'session-a')).toBe(true)
+    await server.stop()
+  })
+
+  it('refuses to start a remote control plane without a persistent device registry', async () => {
+    const server = new ControlPlaneServer({ version: '0.1.0', remoteEnabled: true })
+    await expect(server.start()).rejects.toThrow(/device registry/u)
+  })
+
+  it('marks stale running jobs as interrupted when the daemon restarts', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-stale-'))
+    const file = join(root, 'events.jsonl')
+    const first = new ControlPlaneServer({ version: '0.1.0', eventsPath: file, devicesPath: join(root, 'devices.json') })
+    await first.start()
+    first.events.append('task.updated', { sessionId: 's1', jobs: [{ id: 'j1', kind: 'session.prompt', status: 'running', startedAt: Date.now() }] })
+    first.events.append('task.updated', { sessionId: 's1', jobs: [{ id: 'j2', kind: 'session.prompt', status: 'completed', startedAt: Date.now(), finishedAt: Date.now() }] })
+    await first.events.flush(); await first.stop()
+    const second = new ControlPlaneServer({ version: '0.1.0', eventsPath: file, devicesPath: join(root, 'devices-b.json') })
+    await second.start()
+    const interrupted = second.events.list().find(event => event.type === 'task.updated' && (event.payload as { restarted?: boolean }).restarted === true)
+    expect(interrupted).toBeTruthy()
+    expect((interrupted!.payload as { jobs: Array<{ id: string; status: string }> }).jobs.find(job => job.id === 'j1')?.status).toBe('interrupted')
+    expect((interrupted!.payload as { jobs: Array<{ id: string }> }).jobs.find(job => job.id === 'j2')).toBeUndefined()
+    expect(second.events.list().some(event => event.type === 'job.interrupted')).toBe(true)
+    await second.stop()
   })
 })
 

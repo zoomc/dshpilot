@@ -1,3 +1,7 @@
+import { randomBytes } from 'node:crypto'
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { RemoteControlClient, RelayControlClient } from '../packages/remote-client/src/index.js'
 import { RemoteRelayServer } from '../packages/remote-relay/src/index.js'
@@ -5,10 +9,12 @@ import { ControlPlaneServer, RestrictedRelayTunnel } from '../packages/remote-da
 
 describe('self-hosted relay integration', () => {
   it('completes a restricted desktop outbound relay to PWA control request', async () => {
-    const control = new ControlPlaneServer({ version: '0.1.0', name: 'relayed control', remoteEnabled: true, allowLocalPairingOffer: true }); const controlAddress = await control.start(); const offer = control.devices.createOffer()
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-relay-e2e-'))
+    const control = new ControlPlaneServer({ version: '0.1.0', name: 'relayed control', remoteEnabled: true, allowLocalPairingOffer: true, devicesPath: join(root, 'devices.json') }); const controlAddress = await control.start(); const offer = control.devices.createOffer()
     const relay = new RemoteRelayServer({ token: '0123456789abcdef' }); const relayAddress = await relay.start()
-    const tunnel = new RestrictedRelayTunnel({ relayUrl: `ws://${relayAddress.host}:${relayAddress.port}`, channelId: 'integration', token: '0123456789abcdef', encryptionKey: 'fedcba9876543210-encryption', localBaseUrl: `http://${controlAddress.host}:${controlAddress.port}` }); tunnel.start()
-    const client = new RelayControlClient({ relayUrl: `ws://${relayAddress.host}:${relayAddress.port}`, channelId: 'integration', role: 'client', token: '0123456789abcdef', encryptionKey: 'fedcba9876543210-encryption' })
+    const channelId = randomBytes(24).toString('base64url')
+    const tunnel = new RestrictedRelayTunnel({ relayUrl: `ws://${relayAddress.host}:${relayAddress.port}`, channelId, token: '0123456789abcdef', encryptionKey: 'fedcba9876543210-encryption', localBaseUrl: `http://${controlAddress.host}:${controlAddress.port}` }); tunnel.start()
+    const client = new RelayControlClient({ relayUrl: `ws://${relayAddress.host}:${relayAddress.port}`, channelId, role: 'client', token: '0123456789abcdef', encryptionKey: 'fedcba9876543210-encryption' })
     await expect(client.pair(offer.code, 'relay integration', offer)).resolves.toMatchObject({ device: { name: 'relay integration' } })
     await expect(client.serverInfo()).resolves.toMatchObject({ name: 'relayed control' })
     await expect(client.events(0)).resolves.toMatchObject({ events: expect.any(Array) })

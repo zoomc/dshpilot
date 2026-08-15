@@ -60,15 +60,15 @@ async function main(): Promise<void> {
     || clientBrowserPlugin.name !== 'dshpilot-client' || typeof clientBrowserPlugin.apply !== 'function') {
     throw new Error('DSHPilot Host/Client plugin loading smoke failed')
   }
-  let clientSlotKey: string | undefined
-  let clientRegistration: Record<string, unknown> | undefined
+  const clientSlotKeys: string[] = []
+  const clientRegistrations: Array<Record<string, unknown>> = []
   clientBrowserPlugin.apply({
     slots: {
-      inject(key: string, setup: () => unknown): unknown { clientSlotKey = key; return setup() },
-      register(options: Record<string, unknown>): () => void { clientRegistration = options; return () => { clientRegistration = undefined } },
+      inject(key: string, setup: () => unknown): unknown { clientSlotKeys.push(key); return setup() },
+      register(options: Record<string, unknown>): () => void { clientRegistrations.push(options); return () => { const index = clientRegistrations.indexOf(options); if (index >= 0) clientRegistrations.splice(index, 1) } },
     },
   })
-  if (clientSlotKey !== 'conversation.composer.dock' || clientRegistration?.id !== 'dshpilot-status') {
+  if (!clientSlotKeys.includes('conversation.composer.dock') || !clientSlotKeys.includes('sidebar.footer.action') || !clientRegistrations.some(value => value.id === 'dshpilot-status') || !clientRegistrations.some(value => value.id === 'dshpilot-update')) {
     throw new Error('DSHPilot Client Plugin did not register the official composer dock')
   }
   const runtimeNode = process.platform === 'win32' ? 'node.exe' : 'node'

@@ -1,7 +1,12 @@
-import { appendFile, readFile, mkdir, readdir, stat, writeFile, rename, rm } from 'node:fs/promises'
-import { randomUUID } from 'node:crypto'
+import { appendFile, open, readFile, mkdir, readdir, stat, writeFile, rename, rm } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
+import { lookup } from 'node:dns/promises'
+import http from 'node:http'
+import https from 'node:https'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { isIP } from 'node:net'
 import { promisify } from 'node:util'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { realpath } from 'node:fs/promises'
@@ -25,7 +30,7 @@ export const inject: readonly string[] = ['webServer', 'apiProxy', 'tools', 'loa
 interface HarnessApi {
   sessions: {
     list(request: { rpcId: string; payload: { cursor?: string } }): Promise<{ result: { ok: boolean; value?: { items: readonly HarnessSession[] }; error?: { message?: string } } }>
-    history?(request: { rpcId: string; payload: { sessionId: string; maxMessages?: number } }): Promise<{ result: { ok: boolean; value?: { events: ReadonlyArray<{ event: { type?: string; data?: unknown } }> }; error?: { message?: string } } }>
+    history?(request: { rpcId: string; payload: { sessionId: string; maxMessages?: number } }): Promise<{ result: { ok: boolean; value?: { events: ReadonlyArray<{ event: { type?: string; data?: unknown } }>; projections?: { values?: Record<string, unknown> } }; error?: { message?: string } } }>
     create(request: { rpcId: string; payload: { cwd?: string } }): Promise<{ result: { ok: boolean; value?: { sessionId: string }; error?: { message?: string } } }>
     prompt(request: { rpcId: string; payload: { sessionId: string; mode: 'queue' | 'steer'; content: [{ type: 'text'; text: string }] } }): Promise<HarnessRpcResult>
     cancel(request: { rpcId: string; payload: { sessionId: string } }): Promise<HarnessRpcResult>
@@ -364,10 +369,23 @@ async function tokenRoute(request: IncomingMessage, response: ServerResponse, ct
         }
         if (event.type === 'request/context' && typeof data.contextWindow === 'number' && Number.isFinite(data.contextWindow)) contextWindow = Math.floor(data.contextWindow)
       }
-      if (latestUsage !== undefined || contextWindow !== undefined) official = { usage: latestUsage ?? {}, contextWindow }
+      const projectionValues = history.projections?.values
+      if (projectionValues !== undefined || latestUsage !== undefined || contextWindow !== undefined) official = { usage: latestUsage ?? {}, contextWindow, ...(projectionValues === undefined ? {} : projectionValues) }
     } catch { /* the estimate below is explicit when a history page is unavailable */ }
   }
   json(response, 200, { usage: inspectTokenUsage(official, { messages: [], toolSchemas: ctx.tools?.schemas?.() ?? [], attachmentManifests: [] }), note: official === undefined ? 'Official usage is not exposed by this Harness build; this value is an estimate.' : undefined })
+}
+
+async function sessionsRoute(request: IncomingMessage, response: ServerResponse, ctx: DesktopHostPluginContext): Promise<void> {
+  if (request.method !== 'GET') { json(response, 405, { error: 'method not allowed' }); return }
+  if (ctx.apiProxy?.sessions.list === undefined) { json(response, 503, { error: 'official session API is unavailable' }); return }
+  const value = officialValue(await ctx.apiProxy.sessions.list({ rpcId: requestId(), payload: {} }))
+  const sessions = value.items.map(session => ({
+    sessionId: session.sessionId,
+    running: session.running,
+    updatedAt: session.updatedAt,
+  }))
+  json(response, 200, { runningCount: sessions.filter(session => session.running).length, sessions })
 }
 
 async function notificationRoute(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -422,6 +440,26 @@ async function validateRemoteCwd(cwd: string): Promise<string> {
     if (child === '' || (!child.startsWith('..') && !isAbsolute(child))) return target
   }
   throw new Error('remote cwd is outside the approved workspace roots')
+}
+
+function workspaceId(root: string): string { return `ws_${createHash('sha256').update(root).digest('hex').slice(0, 20)}` }
+
+async function remoteWorkspaceIds(): Promise<string[]> {
+  const roots = await Promise.all(remoteWorkspaceRoots().map(root => realpath(root).catch(() => undefined)))
+  return [...new Set(roots.filter((root): root is string => root !== undefined).map(workspaceId))]
+}
+
+async function workspaceIdForCwd(cwd: string | undefined): Promise<string | undefined> {
+  if (cwd === undefined || cwd === '') return undefined
+  const target = await realpath(cwd).catch(() => undefined)
+  if (target === undefined) return undefined
+  for (const root of remoteWorkspaceRoots()) {
+    const approved = await realpath(root).catch(() => undefined)
+    if (approved === undefined) continue
+    const child = relative(approved, target)
+    if (child === '' || (!child.startsWith('..') && !isAbsolute(child))) return workspaceId(approved)
+  }
+  return undefined
 }
 
 function scalar(value: unknown): string | number | boolean | undefined {
@@ -517,10 +555,30 @@ function boundedNumber(value: unknown, fallback: number, maximum: number): numbe
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? Math.min(value, maximum) : fallback
 }
 
-async function readBoundedFile(path: string, offset = 0, limit = 2 * 1024 * 1024): Promise<{ content: string; offset: number; bytes: number; truncated: boolean }> {
-  const data = await readFile(path)
-  const start = Math.min(offset, data.byteLength); const end = Math.min(data.byteLength, start + limit)
-  return { content: data.subarray(start, end).toString('utf8'), offset: start, bytes: data.byteLength, truncated: end < data.byteLength }
+export async function readBoundedFile(path: string, offset = 0, limit = 2 * 1024 * 1024, signal?: AbortSignal): Promise<{ content: string; offset: number; bytes: number; truncated: boolean }> {
+  const info = await stat(path)
+  const size = info.size
+  const start = Math.max(0, Math.min(Math.trunc(offset), size))
+  const remaining = Math.max(0, Math.trunc(limit))
+  // Stream from disk starting at `start`, bounded to `remaining` bytes. This
+  // avoids reading the entire file into memory for large documents/artifacts
+  // and enforces the byte cap as the stream is consumed, not after a full read.
+  const stream = createReadStream(path, { start, end: remaining === 0 ? start : start + remaining - 1, highWaterMark: 64 * 1024 })
+  const onAbort = (): void => { stream.destroy(new Error('read aborted')) }
+  if (signal !== undefined) { if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true }) }
+  const timeout = setTimeout(() => stream.destroy(new Error('read timed out')), 30_000)
+  const chunks: Buffer[] = []; let read = 0
+  try {
+    for await (const chunk of stream) {
+      const buffer = chunk as Buffer
+      if (read + buffer.length > remaining) { if (remaining > read) { chunks.push(buffer.subarray(0, remaining - read)); read = remaining } stream.destroy(); break }
+      chunks.push(buffer); read += buffer.length
+    }
+  } finally {
+    clearTimeout(timeout)
+    if (signal !== undefined) signal.removeEventListener('abort', onAbort)
+  }
+  return { content: Buffer.concat(chunks).toString('utf8'), offset: start, bytes: size, truncated: start + read < size }
 }
 
 function githubEndpoint(resource: ResourceReference): string {
@@ -535,20 +593,95 @@ function githubEndpoint(resource: ResourceReference): string {
   throw new Error('GitHub resource locator does not match its declared kind')
 }
 
+function ipv4Forbidden(value: string): boolean {
+  const parts = value.split('.').map(Number)
+  if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return true
+  const [first, second] = parts
+  return first === 0 || first === 10 || first === 127 || first === 169 && second === 254
+    || first === 172 && second >= 16 && second <= 31 || first === 192 && second === 168
+    || first === 100 && second >= 64 && second <= 127 || first === 198 && (second === 18 || second === 19)
+    || first >= 224
+}
+
+function ipv6Forbidden(value: string): boolean {
+  const normalized = value.toLowerCase().replace(/^\[|\]$/gu, '')
+  if (normalized === '::' || normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe8') || normalized.startsWith('fe9') || normalized.startsWith('fea') || normalized.startsWith('feb') || normalized.startsWith('ff') || normalized.startsWith('fec')) return true
+  if (normalized.startsWith('::ffff:')) {
+    const tail = normalized.slice('::ffff:'.length)
+    if (tail.includes('.') && ipv4Forbidden(tail)) return true
+    const groups = tail.split(':')
+    if (groups.length === 2 && groups.every(group => /^[0-9a-f]{1,4}$/u.test(group))) {
+      const mapped = `${Number.parseInt(groups[0], 16) >> 8}.${Number.parseInt(groups[0], 16) & 255}.${Number.parseInt(groups[1], 16) >> 8}.${Number.parseInt(groups[1], 16) & 255}`
+      return ipv4Forbidden(mapped)
+    }
+  }
+  return false
+}
+
+async function assertPublicUrl(value: URL): Promise<void> {
+  if (value.protocol !== 'https:' && value.protocol !== 'http:') throw new Error('URL resource must use http or https')
+  if (value.username !== '' || value.password !== '') throw new Error('URL resource must not contain credentials')
+  await resolvePublicAddresses(value.hostname)
+}
+
+/** Resolve a hostname and reject private/loopback/multicast addresses. The
+ *  returned addresses are pinned to the actual socket so a second DNS lookup
+ *  (TOCTOU / DNS-rebinding) cannot return a different, internal IP mid-fetch. */
+export async function resolvePublicAddresses(hostname: string): Promise<string[]> {
+  const host = hostname.replace(/^\[|\]$/gu, '').toLowerCase()
+  const addresses = isIP(host) === 0 ? (await lookup(host, { all: true, verbatim: true })).map(entry => entry.address) : [host]
+  if (addresses.length === 0 || addresses.some(address => isIP(address) === 4 ? ipv4Forbidden(address) : ipv6Forbidden(address))) throw new Error('URL resource points to a private or loopback address')
+  return addresses
+}
+
+interface PinnedResponse { status: number; location: string | null; contentType: string; body: IncomingMessage }
+function fetchOverPinned(url: URL, pinnedIp: string, signal: AbortSignal): Promise<PinnedResponse> {
+  const family = isIP(pinnedIp) === 6 ? 6 : 4
+  const lib = url.protocol === 'https:' ? https : http
+  const agent = new lib.Agent({ lookup: (host, options, callback) => callback(null, pinnedIp, family) })
+  const requestOptions: http.RequestOptions & { servername?: string } = { method: 'GET', agent, headers: { host: url.host, 'user-agent': 'DSHPilot' }, signal: signal as AbortSignal }
+  if (url.protocol === 'https:') requestOptions.servername = url.hostname
+  return new Promise((resolveReq, rejectReq) => {
+    const request = lib.request(url, requestOptions as http.RequestOptions, response => {
+      resolveReq({ status: response.statusCode ?? 0, location: response.headers.location ?? null, contentType: response.headers['content-type'] ?? 'application/octet-stream', body: response })
+    })
+    request.on('error', rejectReq)
+    if (signal.aborted) request.destroy()
+    signal.addEventListener('abort', () => request.destroy(), { once: true })
+    request.end()
+  })
+}
+
+const MAX_URL_BYTES = 2 * 1024 * 1024
 async function fetchUrlResource(resource: ResourceReference): Promise<{ url: string; mediaType: string; content: string; truncated: boolean }> {
-  const url = new URL(resource.locator)
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error('URL resource must use http or https')
-  const hostname = url.hostname.toLowerCase()
-  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0' || hostname === '::1' || hostname.startsWith('10.') || hostname.startsWith('192.168.') || hostname.startsWith('169.254.') || /^172\.(1[6-9]|2\d|3[01])\./u.test(hostname)) throw new Error('URL resource points to a private or loopback address')
+  let url = new URL(resource.locator)
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 15_000)
   try {
-    const response = await fetch(url, { signal: controller.signal, redirect: 'error' })
-    if (!response.ok) throw new Error(`URL resource returned HTTP ${response.status}`)
-    const reader = response.body?.getReader(); if (reader === undefined) throw new Error('URL resource has no response body')
-    const chunks: Uint8Array[] = []; let bytes = 0; let truncated = false
-    while (true) { const next = await reader.read(); if (next.done) break; const remaining = 2 * 1024 * 1024 - bytes; if (next.value.byteLength > remaining) { chunks.push(next.value.subarray(0, remaining)); bytes += remaining; truncated = true; break } bytes += next.value.byteLength; chunks.push(next.value) }
-    const data = new Uint8Array(bytes); let offset = 0; for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.byteLength }
-    return { url: resource.locator, mediaType: response.headers.get('content-type') ?? 'application/octet-stream', content: Buffer.from(data).toString('utf8'), truncated }
+    for (let redirect = 0; redirect <= 3; redirect += 1) {
+      await assertPublicUrl(url)
+      const addresses = await resolvePublicAddresses(url.hostname)
+      // Pin the first validated address for this hop. The connection dials the
+      // pinned IP while preserving the original Host/SNI, so a rebinding
+      // second lookup cannot redirect the socket to an internal address.
+      const response = await fetchOverPinned(url, addresses[0], controller.signal)
+      if (response.status >= 300 && response.status < 400) {
+        if (response.location === null || redirect === 3) throw new Error('URL resource redirect chain is invalid or too long')
+        // Each redirect re-resolves and re-validates the target host.
+        url = new URL(response.location, url)
+        continue
+      }
+      if (response.status < 200 || response.status >= 300) throw new Error(`URL resource returned HTTP ${response.status}`)
+      const chunks: Uint8Array[] = []; let bytes = 0; let truncated = false
+      for await (const chunk of response.body) {
+        const data = chunk as Uint8Array
+        const remaining = MAX_URL_BYTES - bytes
+        if (data.byteLength > remaining) { if (remaining > 0) { chunks.push(data.subarray(0, remaining)); bytes += remaining } truncated = true; response.body.destroy(); break }
+        bytes += data.byteLength; chunks.push(data)
+      }
+      const merged = new Uint8Array(bytes); let offset = 0; for (const chunk of chunks) { merged.set(chunk, offset); offset += chunk.byteLength }
+      return { url: url.toString(), mediaType: response.contentType, content: Buffer.from(merged).toString('utf8'), truncated }
+    }
+    throw new Error('URL resource redirect chain is invalid')
   } finally { clearTimeout(timer) }
 }
 
@@ -650,6 +783,7 @@ function createRemoteAdapter(api: HarnessApi): {
   type RemoteProjection = { schemaVersion: 1; jobs: HarnessJob[]; permissions: PendingPermission[]; questions: PendingQuestion[]; lineage: SessionLineage[] }
   const jobs = new Map<string, HarnessJob>()
   const sessionJobs = new Map<string, Set<string>>()
+  const sessionWorkspaceIds = new Map<string, string>()
   const permissions = new Map<string, PendingPermission>()
   const questions = new Map<string, PendingQuestion>()
   const artifacts = new ArtifactStore(dshHome())
@@ -692,11 +826,17 @@ function createRemoteAdapter(api: HarnessApi): {
       const value = officialValue(await api.sessions.list({ rpcId: requestId(), payload: {} }))
       for (const session of value.items) lineage.add({ sessionId: session.sessionId, parentSessionId: session.parentSessionId, rootSessionId: session.parentSessionId === undefined ? session.sessionId : (lineage.lineage(session.parentSessionId)[0]?.rootSessionId ?? session.parentSessionId), createdAt: new Date(session.updatedAt).toISOString() })
       persistProjection()
-      return value.items.map(session => ({ ...sessionSummary(session), status: Array.from(permissions.values()).some(item => item.sessionId === session.sessionId) || Array.from(questions.values()).some(item => item.sessionId === session.sessionId) ? 'waiting' as const : sessionSummary(session).status }))
+      const summaries = await Promise.all(value.items.map(async session => {
+        const summary = sessionSummary(session)
+        const currentWorkspaceId = await workspaceIdForCwd(session.cwd)
+        if (currentWorkspaceId !== undefined) sessionWorkspaceIds.set(session.sessionId, currentWorkspaceId)
+        return { ...summary, ...(currentWorkspaceId === undefined ? {} : { workspaceId: currentWorkspaceId }), status: Array.from(permissions.values()).some(item => item.sessionId === session.sessionId) || Array.from(questions.values()).some(item => item.sessionId === session.sessionId) ? 'waiting' as const : summary.status }
+      }))
+      return summaries
     },
     tasks: async (): Promise<TaskSummary[]> => [...jobs.values()].map(job => ({
       taskId: job.id, ...(job.sessionId === undefined ? {} : { sessionId: job.sessionId }), status: job.status === 'running' ? 'running' : job.status === 'stopping' ? 'waiting' : job.status === 'completed' ? 'completed' : job.status === 'killed' ? 'cancelled' : 'failed',
-      title: job.kind, updatedAt: new Date(job.finishedAt ?? job.startedAt).toISOString(),
+      ...(job.sessionId === undefined || sessionWorkspaceIds.get(job.sessionId) === undefined ? {} : { workspaceId: sessionWorkspaceIds.get(job.sessionId) }), title: job.kind, updatedAt: new Date(job.finishedAt ?? job.startedAt).toISOString(),
     })),
     admitPrompt: async (request: { requestId: string; sessionId?: string; input: string; mode?: 'queue' | 'steer'; cwd?: string }): Promise<{ taskId: string }> => {
       let sessionId = request.sessionId
@@ -768,7 +908,7 @@ function createRemoteAdapter(api: HarnessApi): {
             server.events.append('task.updated', { sessionId: frame.sessionId, jobs: frame.jobs.map(job => ({ id: job.id, kind: job.kind, status: job.status, startedAt: job.startedAt, finishedAt: job.finishedAt })) })
           } else if (frame.type === 'approval/requested') {
             const permissionId = frame.approvalId
-            permissions.set(permissionId, { rpcId: envelope.rpcId, sessionId: frame.sessionId, approvalId: frame.approvalId, summary: { permissionId, sessionId: frame.sessionId, tool: frame.toolName, description: frame.reason, status: 'pending', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() } })
+            permissions.set(permissionId, { rpcId: envelope.rpcId, sessionId: frame.sessionId, approvalId: frame.approvalId, summary: { permissionId, sessionId: frame.sessionId, ...(sessionWorkspaceIds.get(frame.sessionId) === undefined ? {} : { workspaceId: sessionWorkspaceIds.get(frame.sessionId) }), tool: frame.toolName, description: frame.reason, status: 'pending', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() } })
             persistProjection()
             server.events.append('permission.requested', { permissionId, sessionId: frame.sessionId, tool: frame.toolName })
             void appendEventNotification(`approval-${permissionId}`, 'approval-needed', 'Approval required', frame.toolName)
@@ -838,14 +978,30 @@ function startRemoteControl(ctx: DesktopHostPluginContext): void {
     const tls = tlsKeyPath !== undefined && tlsCertPath !== undefined ? { key: await read(resolve(tlsKeyPath)), cert: await read(resolve(tlsCertPath)) } : undefined
     if (relayValues.some(value => value !== undefined) && !relayConfigured) throw new Error('DSHPILOT_REMOTE_RELAY_URL, _TOKEN, _CHANNEL, and _KEY must be configured together')
     await bridge.hydrate()
-    server = new ControlPlaneServer({ name: 'DSHPilot self-hosted Harness control plane', version: '0.1.0', host, port, remoteEnabled: true, tls, corsOrigins, allowedHosts, eventsPath, devicesPath, relayEnabled: true, allowLocalPairingOffer: process.env.DSHPILOT_REMOTE_ALLOW_LOCAL_PAIRING === '1' || relayConfigured, allowLocalAdminPairing: process.env.DSHPILOT_REMOTE_ALLOW_LOCAL_ADMIN === '1', authorization: async context => {
+    const workspaceIds = await remoteWorkspaceIds()
+    server = new ControlPlaneServer({ name: 'DSHPilot self-hosted Harness control plane', version: '0.1.0', host, port, remoteEnabled: true, tls, corsOrigins, allowedHosts, workspaceIds, eventsPath, devicesPath, relayEnabled: true, allowLocalPairingOffer: process.env.DSHPILOT_REMOTE_ALLOW_LOCAL_PAIRING === '1' || relayConfigured, allowLocalAdminPairing: process.env.DSHPILOT_REMOTE_ALLOW_LOCAL_ADMIN === '1', authorization: async context => {
       if (context.cwd !== undefined && context.cwd !== '') await validateRemoteCwd(context.cwd)
-      if (context.sessionId !== undefined) { const sessions = await bridge.adapter.sessions(); if (!sessions.some(session => session.sessionId === context.sessionId)) return { allowed: false, code: 'SESSION_NOT_FOUND', message: 'session is not owned by this Harness instance' } }
+      if (context.sessionId !== undefined) { const sessions = await bridge.adapter.sessions(); const session = sessions.find(item => item.sessionId === context.sessionId); if (session === undefined) return { allowed: false, code: 'SESSION_NOT_FOUND', message: 'session is not owned by this Harness instance' }; if (context.device?.workspaceIds !== undefined && context.device.workspaceIds.length > 0 && session.workspaceId !== undefined && !context.device.workspaceIds.includes(session.workspaceId)) return { allowed: false, code: 'WORKSPACE_FORBIDDEN', message: 'device is not paired for this session workspace' } }
+      if (context.cwd !== undefined && context.device?.workspaceIds !== undefined && context.device.workspaceIds.length > 0) { const currentWorkspaceId = await workspaceIdForCwd(context.cwd); if (currentWorkspaceId === undefined || !context.device.workspaceIds.includes(currentWorkspaceId)) return { allowed: false, code: 'WORKSPACE_FORBIDDEN', message: 'device is not paired for this workspace' } }
       if (context.artifactId !== undefined) { const artifacts = await bridge.adapter.artifacts(); if (!artifacts.some(item => typeof item === 'object' && item !== null && (item as { artifactId?: unknown }).artifactId === context.artifactId)) return { allowed: false, code: 'ARTIFACT_NOT_FOUND', message: 'artifact is not owned by this Harness instance' } }
       if (context.resourceId !== undefined) { const resources = await bridge.adapter.resources(); if (!resources.some(item => typeof item === 'object' && item !== null && (item as { resourceId?: unknown }).resourceId === context.resourceId)) return { allowed: false, code: 'RESOURCE_NOT_FOUND', message: 'resource is not owned by this Harness instance' } }
       const request = context.request
-      if (request?.kind === 'permission_reply') { const permissions = await bridge.adapter.permissions(); if (!permissions.some(permission => permission.permissionId === request.permissionId && permission.status === 'pending')) return { allowed: false, code: 'PERMISSION_NOT_FOUND', message: 'permission is no longer pending' } }
-      if (request?.kind === 'question_reply') { const questions = await bridge.adapter.questions(); if (!questions.some(item => typeof item === 'object' && item !== null && (item as { rpcId?: unknown }).rpcId === request.rpcId)) return { allowed: false, code: 'QUESTION_NOT_FOUND', message: 'question is no longer pending' } }
+      if (request?.kind === 'permission_reply') {
+        const permissions = await bridge.adapter.permissions()
+        const match = permissions.find(permission => permission.permissionId === request.permissionId && permission.status === 'pending')
+        if (match === undefined) return { allowed: false, code: 'PERMISSION_NOT_FOUND', message: 'permission is no longer pending' }
+        if (match.workspaceId !== undefined && context.device?.workspaceIds !== undefined && context.device.workspaceIds.length > 0 && !context.device.workspaceIds.includes(match.workspaceId)) return { allowed: false, code: 'WORKSPACE_FORBIDDEN', message: 'device is not paired for this permission workspace' }
+      }
+      if (request?.kind === 'question_reply') {
+        const questions = await bridge.adapter.questions()
+        const match = questions.find(item => typeof item === 'object' && item !== null && (item as { rpcId?: unknown }).rpcId === request.rpcId)
+        if (match === undefined) return { allowed: false, code: 'QUESTION_NOT_FOUND', message: 'question is no longer pending' }
+        if (context.device?.workspaceIds !== undefined && context.device.workspaceIds.length > 0) {
+          const sessionId = (match as { sessionId?: unknown }).sessionId
+          const session = (await bridge.adapter.sessions()).find(item => item.sessionId === sessionId)
+          if (session?.workspaceId !== undefined && !context.device.workspaceIds.includes(session.workspaceId)) return { allowed: false, code: 'WORKSPACE_FORBIDDEN', message: 'device is not paired for this question workspace' }
+        }
+      }
       return true
     }, adapter: bridge.adapter })
     const address = await server.start()
@@ -857,7 +1013,7 @@ function startRemoteControl(ctx: DesktopHostPluginContext): void {
       relayTunnel.start()
       console.log(JSON.stringify({ dshpilotRelayTunnel: 'ready', relayUrl, channelId: relayChannel }))
     }
-    if (process.env.DSHPILOT_REMOTE_PRINT_PAIRING === '1') console.log(JSON.stringify({ dshpilotPairingOffer: server.devices.createOffer() }))
+    if (process.env.DSHPILOT_REMOTE_PRINT_PAIRING === '1') console.log(JSON.stringify({ dshpilotPairingOffer: server.devices.createOffer(120_000, workspaceIds) }))
     void bridge.pump(server, abort.signal).catch(error => { if (!abort.signal.aborted) console.error(`DSHPilot remote event bridge stopped: ${String(error)}`) })
   }
   void start().catch(error => console.error(`DSHPilot remote control failed: ${String(error)}`))
@@ -902,6 +1058,7 @@ export async function apply(ctx: DesktopHostPluginContext): Promise<void> {
   ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/documents', handler: (request, response) => documentRoute(request, response) }),
   ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/resources', handler: (request, response) => resourceRoute(request, response) }),
   ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/tokens', handler: (request, response) => tokenRoute(request, response, ctx) }),
+  ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/sessions', handler: (request, response) => sessionsRoute(request, response, ctx) }),
   ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/notifications', handler: (request, response) => notificationRoute(request, response) }),
   ].filter((value): value is () => void => value !== undefined)
   ctx.effect?.(() => () => { for (const dispose of disposers) dispose() }, 'dshpilot.desktop.routes')

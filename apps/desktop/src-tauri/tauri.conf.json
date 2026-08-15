@@ -27,8 +27,12 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.png", "icons/icon.ico"],
-    "createUpdaterArtifacts": true
+    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "../../../runtime/current": "runtime",
+      "../../../runtime/current.json": "runtime/current.json"
+    }
   },
   "plugins": {
     "updater": {

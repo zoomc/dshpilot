@@ -17,6 +17,8 @@
     }
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.5.0",
+    "@tauri-apps/plugin-updater": "^2.5.0",
     "react": "^19.1.0"
   },
   "devDependencies": {

@@ -13,7 +13,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -24,7 +24,7 @@ use std::os::unix::process::CommandExt;
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use keyring::Entry;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -57,10 +57,12 @@ impl Drop for RuntimeUpdateGuard {
 }
 
 struct RunningHarness {
-    child: Child,
+    child: Option<Child>,
+    pid: u32,
     url: String,
     stopping: Arc<AtomicBool>,
     generation: u64,
+    managed: bool,
 }
 
 #[derive(Default)]
@@ -103,6 +105,28 @@ struct RuntimePaths {
     mcp_state: String,
     mcp_patch: String,
     documents: String,
+    service_registry: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct DshServiceRegistration {
+    pid: u32,
+    url: String,
+    runtime_version: Option<String>,
+    upstream_sha: Option<String>,
+    owner_instance_id: String,
+    managed: bool,
+    started_at: String,
+}
+
+#[derive(Serialize)]
+struct RuntimeUpdateInfo {
+    available: bool,
+    current_version: Option<String>,
+    candidate_version: String,
+    candidate_upstream_sha: Option<String>,
+    manifest_url: String,
+    checked_at: String,
 }
 
 fn copy_runtime_seed(source: &Path, destination: &Path) -> Result<(), String> {
@@ -158,6 +182,11 @@ fn app_paths(app: &AppHandle) -> Result<RuntimePaths, String> {
             .join("documents")
             .display()
             .to_string(),
+        service_registry: app_data
+            .join("desktop")
+            .join("dsh-service.json")
+            .display()
+            .to_string(),
     };
     for path in [
         PathBuf::from(&paths.app_data),
@@ -200,6 +229,72 @@ fn readiness_url(line: &str) -> Option<String> {
     Some(candidate.to_string())
 }
 
+fn is_loopback_url(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && url.port().is_some()
+}
+
+/// Decode an HTTP message body, transparently handling `Transfer-Encoding:
+/// chunked` (RFC 9112). A plain body (with `Content-Length`) is returned as-is.
+///
+/// The previous probe naively split on `\r\n\r\n` and assumed the rest was the
+/// JSON body. When the Harness answered a health probe without `Content-Length`
+/// it used chunked encoding, so the body carried `chunk-size` framing lines that
+/// made `serde_json` fail and broke readiness on Windows/macOS CI.
+fn decode_http_body(header: &str, body: &[u8]) -> String {
+    let chunked = header.lines().any(|line| {
+        let lower = line.trim().to_ascii_lowercase();
+        lower.starts_with("transfer-encoding:") && lower.contains("chunked")
+    });
+    if !chunked {
+        return String::from_utf8_lossy(body).into_owned();
+    }
+    let mut decoded: Vec<u8> = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < body.len() {
+        while cursor < body.len() && (body[cursor] == b'\r' || body[cursor] == b'\n') {
+            cursor += 1;
+        }
+        let Some(line_end) = body[cursor..]
+            .iter()
+            .position(|&b| b == b'\r' || b == b'\n')
+            .map(|p| cursor + p)
+        else {
+            break;
+        };
+        let size_line = match std::str::from_utf8(&body[cursor..line_end]) {
+            Ok(value) => value.trim().to_string(),
+            Err(_) => break,
+        };
+        if size_line.is_empty() {
+            break;
+        }
+        let size = usize::from_str_radix(size_line.split(';').next().unwrap_or("0"), 16)
+            .unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        cursor = line_end + 1;
+        if cursor < body.len() && body[cursor] == b'\n' {
+            cursor += 1;
+        }
+        if cursor + size > body.len() {
+            break;
+        }
+        decoded.extend_from_slice(&body[cursor..cursor + size]);
+        cursor += size;
+        if cursor < body.len() && body[cursor] == b'\r' {
+            cursor += 1;
+        }
+        if cursor < body.len() && body[cursor] == b'\n' {
+            cursor += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 fn http_probe(base_url: &str, path: &str) -> Result<(u16, String), String> {
     let base =
         url::Url::parse(base_url).map_err(|error| format!("invalid Harness URL: {error}"))?;
@@ -239,11 +334,11 @@ fn http_probe(base_url: &str, path: &str) -> Result<(u16, String), String> {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|value| value.parse::<u16>().ok())
         .ok_or_else(|| "Harness health status is malformed".to_string())?;
-    let body = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or_default()
-        .to_string();
+    let (header, body) = match text.find("\r\n\r\n") {
+        Some(index) => (&text[..index], &response[index + 4..]),
+        None => ("", &response[..]),
+    };
+    let body = decode_http_body(header, body);
     Ok((status, body))
 }
 
@@ -297,10 +392,158 @@ fn wait_for_health(url: &str) -> Result<(), String> {
     Err(last_error)
 }
 
+/// The official `dsh web` profile defaults to port 3080. When a user started
+/// that service outside DSHPilot, discover and adopt its loopback Web UI
+/// instead of silently starting a second Harness instance. The external
+/// process remains externally owned and is never killed by the desktop.
+fn discover_external_harness() -> Option<(String, u32)> {
+    for port in [3080u16] {
+        let url = format!("http://127.0.0.1:{port}");
+        if let Ok((status, body)) = http_probe(&url, "/") {
+            let html = body.to_ascii_lowercase();
+            if !((200..300).contains(&status)
+                && (html.contains("<!doctype html>") || html.contains("<html")))
+            {
+                continue;
+            }
+            // Only adopt a Harness that DSHPilot actually manages. The DSHPilot
+            // Host plugin exposes `/__dshpilot/health`; a plain `dsh web` has no
+            // such route and answers 404/5xx, so we refuse to adopt it instead of
+            // silently starting a second instance or hijacking an unrelated service.
+            let dshpilot_managed = match http_probe(&url, "/__dshpilot/health") {
+                Ok((health_status, health_body)) if (200..300).contains(&health_status) => {
+                    serde_json::from_str::<serde_json::Value>(&health_body)
+                        .map(|health| {
+                            health.get("status").and_then(serde_json::Value::as_str)
+                                == Some("ready")
+                        })
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+            if !dshpilot_managed {
+                continue;
+            }
+            #[cfg(unix)]
+            let pid = Command::new("lsof")
+                .args(["-ti", &format!("tcp:{port}")])
+                .output()
+                .ok()
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|output| output.lines().next()?.trim().parse::<u32>().ok());
+            #[cfg(windows)]
+            let pid = Command::new("cmd")
+                .args([
+                    "/C",
+                    &format!("netstat -ano | findstr LISTENING | findstr :{port}"),
+                ])
+                .output()
+                .ok()
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|output| output.split_whitespace().last()?.parse::<u32>().ok());
+            if let Some(pid) = pid {
+                return Some((url, pid));
+            }
+        }
+    }
+    None
+}
+
 fn log_line(log_path: &Path, line: &str) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
         let _ = writeln!(file, "{line}");
     }
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        return Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|value| value.success())
+            .unwrap_or(false);
+    }
+    #[cfg(windows)]
+    {
+        return Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .output()
+            .map(|value| String::from_utf8_lossy(&value.stdout).contains(&pid.to_string()))
+            .unwrap_or(false);
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+fn service_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| format!("unix:{}", value.as_secs()))
+        .unwrap_or_else(|_| "unknown".into())
+}
+
+fn write_service_registration(
+    paths: &RuntimePaths,
+    url: &str,
+    pid: u32,
+    managed: bool,
+) -> Result<(), String> {
+    let current = PathBuf::from(&paths.runtime).join("current.json");
+    let (runtime_version, upstream_sha) = fs::read_to_string(current)
+        .ok()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+        .map(|value| {
+            (
+                value
+                    .get("runtimeVersion")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                value
+                    .get("upstream")
+                    .and_then(|item| item.get("sha"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            )
+        })
+        .unwrap_or((None, None));
+    let value = DshServiceRegistration {
+        pid,
+        url: url.to_owned(),
+        runtime_version: runtime_version.clone(),
+        upstream_sha: upstream_sha.clone(),
+        owner_instance_id: format!("dshpilot-{}", std::process::id()),
+        managed,
+        started_at: service_timestamp(),
+    };
+    let path = PathBuf::from(&paths.service_registry);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("unable to create service registry dir: {error}"))?;
+    }
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(&value)
+        .map_err(|error| format!("unable to serialize service registration: {error}"))?;
+    fs::write(&temporary, &bytes)
+        .map_err(|error| format!("unable to write service registration tmp: {error}"))?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&path);
+        fs::rename(&temporary, &path)
+            .map_err(|rename_error| format!("unable to install service registration: {error}; {rename_error}"))?;
+    }
+    Ok(())
+}
+
+fn registered_service(paths: &RuntimePaths) -> Option<DshServiceRegistration> {
+    let value = fs::read_to_string(&paths.service_registry).ok()?;
+    let registration = serde_json::from_str::<DshServiceRegistration>(&value).ok()?;
+    if registration.pid == 0
+        || !is_loopback_url(&registration.url)
+        || !process_alive(registration.pid)
+    {
+        return None;
+    }
+    Some(registration)
 }
 
 fn dsh_command(_app: &AppHandle, paths: &RuntimePaths) -> Result<(PathBuf, Vec<String>), String> {
@@ -391,6 +634,127 @@ fn dsh_command(_app: &AppHandle, paths: &RuntimePaths) -> Result<(PathBuf, Vec<S
         "0".into(),
     ]);
     Ok((node, args))
+}
+
+fn default_runtime_manifest_url() -> String {
+    let suffix = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-arm64",
+        ("macos", "x86_64") => "darwin-x64",
+        ("windows", "x86_64") => "windows-x64",
+        ("linux", "x86_64") => "linux-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        _ => "unsupported",
+    };
+    format!("https://github.com/zoomc/dshpilot/releases/latest/download/current-{suffix}.json")
+}
+
+fn runtime_manifest_url(value: Option<String>) -> Result<url::Url, String> {
+    let raw = value.unwrap_or_else(default_runtime_manifest_url);
+    let parsed =
+        url::Url::parse(&raw).map_err(|error| format!("invalid runtime manifest URL: {error}"))?;
+    let loopback_http =
+        parsed.scheme() == "http" && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"));
+    if parsed.scheme() != "https" && !(cfg!(debug_assertions) && loopback_http) {
+        return Err("runtime manifest URL must use HTTPS (loopback HTTP is debug-only)".into());
+    }
+    Ok(parsed)
+}
+
+fn download_runtime_manifest(
+    manifest_url: Option<String>,
+) -> Result<(url::Url, serde_json::Value), String> {
+    let parsed = runtime_manifest_url(manifest_url)?;
+    let response = reqwest::blocking::get(parsed.clone())
+        .map_err(|error| format!("runtime manifest download failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "runtime manifest download failed: HTTP {}",
+            response.status()
+        ));
+    }
+    if response.content_length().unwrap_or(0) > 1_048_576 {
+        return Err("runtime manifest is too large".into());
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|error| format!("runtime manifest read failed: {error}"))?;
+    if bytes.len() > 1_048_576 {
+        return Err("runtime manifest is too large".into());
+    }
+    let manifest = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("runtime manifest JSON is invalid: {error}"))?;
+    validate_runtime_candidate(&manifest)?;
+    Ok((parsed, manifest))
+}
+
+fn validate_runtime_candidate(manifest: &serde_json::Value) -> Result<(), String> {
+    if manifest
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || manifest.get("channel").and_then(serde_json::Value::as_str) != Some("tested")
+    {
+        return Err("runtime manifest must be schemaVersion=1/channel=tested".into());
+    }
+    let runtime_id = manifest
+        .get("runtimeVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "runtime manifest is missing runtimeVersion".to_string())?;
+    if runtime_id.is_empty()
+        || runtime_id.len() > 160
+        || !runtime_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err("runtimeVersion contains unsafe path characters".into());
+    }
+    let node = manifest
+        .get("node")
+        .ok_or_else(|| "runtime manifest is missing node metadata".to_string())?;
+    let expected_platform = match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        value => value,
+    };
+    let expected_arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        value => value,
+    };
+    if node.get("platform").and_then(serde_json::Value::as_str) != Some(expected_platform)
+        || node.get("arch").and_then(serde_json::Value::as_str) != Some(expected_arch)
+    {
+        return Err("runtime platform/architecture does not match this desktop".into());
+    }
+    let artifact = manifest
+        .get("artifact")
+        .ok_or_else(|| "runtime manifest is missing artifact metadata".to_string())?;
+    let sha256 = artifact
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("runtime artifact sha256 is invalid".into());
+    }
+    let size = artifact
+        .get("size")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "runtime artifact size is invalid".to_string())?;
+    if size == 0 || size > 4 * 1024 * 1024 * 1024 {
+        return Err("runtime artifact size is invalid".into());
+    }
+    if artifact
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+        || artifact
+            .get("signature")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return Err("runtime artifact metadata is incomplete".into());
+    }
+    Ok(())
 }
 
 fn allow_unsigned_runtime() -> bool {
@@ -605,22 +969,50 @@ fn recover_previous_runtime(paths: &RuntimePaths) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Last-resort recovery: when both `current` and `previous` Runtime manifests are
+/// unusable (e.g. a corrupt on-disk Runtime), promote the Runtime seed embedded in
+/// the application bundle (shipped under `resources/runtime`). This keeps the
+/// desktop usable instead of failing closed, closing the P0 "no embedded
+/// bootstrap when current Runtime is corrupt" gap.
+fn recover_embedded_runtime(app: &AppHandle, paths: &RuntimePaths) -> Result<bool, String> {
+    let Some(resource_dir) = app.path().resource_dir().ok() else {
+        return Ok(false);
+    };
+    let resource_runtime = resource_dir.join("runtime");
+    let resource_manifest = resource_runtime.join("current.json");
+    if !resource_manifest.exists() {
+        return Ok(false);
+    }
+    copy_runtime_seed(&resource_runtime, Path::new(&paths.runtime))
+        .map_err(|error| format!("unable to recover embedded runtime: {error}"))?;
+    fs::copy(
+        &resource_manifest,
+        Path::new(&paths.runtime).join("current.json"),
+    )
+    .map_err(|error| format!("unable to install embedded runtime manifest: {error}"))?;
+    Ok(true)
+}
+
 fn stop_child(running: &mut RunningHarness) {
+    if running.child.is_none() && !running.managed {
+        return;
+    }
     running.stopping.store(true, Ordering::SeqCst);
+    let pid = running.pid;
     #[cfg(unix)]
     {
         let _ = Command::new("kill")
-            .args(["-TERM", &format!("-{}", running.child.id())])
+            .args(["-TERM", &format!("-{pid}")])
             .status();
     }
     #[cfg(not(unix))]
     {
         let _ = Command::new("taskkill")
-            .args(["/PID", &running.child.id().to_string(), "/T"])
+            .args(["/PID", &pid.to_string(), "/T"])
             .status();
     }
     for _ in 0..50 {
-        if running.child.try_wait().ok().flatten().is_some() {
+        if !process_alive(pid) {
             return;
         }
         thread::sleep(Duration::from_millis(100));
@@ -628,16 +1020,18 @@ fn stop_child(running: &mut RunningHarness) {
     #[cfg(unix)]
     {
         let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{}", running.child.id())])
+            .args(["-KILL", &format!("-{pid}")])
             .status();
     }
     #[cfg(not(unix))]
     {
         let _ = Command::new("taskkill")
-            .args(["/PID", &running.child.id().to_string(), "/T", "/F"])
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
             .status();
     }
-    let _ = running.child.wait();
+    if let Some(child) = running.child.as_mut() {
+        let _ = child.wait();
+    }
 }
 
 fn cleanup_descendants(pid: u32) {
@@ -733,6 +1127,7 @@ fn monitor_harness(
     args: Vec<String>,
     dsh_home: String,
     log_path: PathBuf,
+    managed: bool,
 ) {
     thread::spawn(move || {
         let mut restart_count = 0u32;
@@ -746,25 +1141,34 @@ fn monitor_harness(
                 let Some(running) = guard.as_mut() else {
                     return;
                 };
-                match running.child.try_wait() {
-                    Ok(Some(_status)) => (
-                        true,
+                if let Some(child) = running.child.as_mut() {
+                    match child.try_wait() {
+                        Ok(Some(_status)) => (
+                            true,
+                            running.stopping.clone(),
+                            running.generation,
+                            running.pid,
+                        ),
+                        Ok(None) => (
+                            false,
+                            running.stopping.clone(),
+                            running.generation,
+                            running.pid,
+                        ),
+                        Err(_) => (
+                            true,
+                            running.stopping.clone(),
+                            running.generation,
+                            running.pid,
+                        ),
+                    }
+                } else {
+                    (
+                        !process_alive(running.pid),
                         running.stopping.clone(),
                         running.generation,
-                        running.child.id(),
-                    ),
-                    Ok(None) => (
-                        false,
-                        running.stopping.clone(),
-                        running.generation,
-                        running.child.id(),
-                    ),
-                    Err(_) => (
-                        true,
-                        running.stopping.clone(),
-                        running.generation,
-                        running.child.id(),
-                    ),
+                        running.pid,
+                    )
                 }
             };
             if !unexpected_exit {
@@ -778,6 +1182,16 @@ fn monitor_harness(
                 if let Ok(mut snapshot) = status.lock() {
                     snapshot.state = "stopped".into();
                     snapshot.phase = "spawn".into();
+                    snapshot.url = None;
+                    snapshot.pid = None;
+                }
+                return;
+            }
+            if !managed {
+                if let Ok(mut snapshot) = status.lock() {
+                    snapshot.state = "failed".into();
+                    snapshot.phase = "health".into();
+                    snapshot.last_error = Some("attached external dsh service exited".into());
                     snapshot.url = None;
                     snapshot.pid = None;
                 }
@@ -824,10 +1238,12 @@ fn monitor_harness(
                         let pid = child.id();
                         if let Ok(mut guard) = state.lock() {
                             *guard = Some(RunningHarness {
-                                child,
+                                child: Some(child),
+                                pid,
                                 url: url.clone(),
                                 stopping: stopping.clone(),
                                 generation,
+                                managed: true,
                             });
                         }
                         stable_since = Some(std::time::Instant::now());
@@ -884,12 +1300,82 @@ fn start_harness(
     }
     let paths = app_paths(app)?;
     let log_path = PathBuf::from(&paths.logs).join("harness.log");
+    if let Some(registration) = registered_service(&paths) {
+        if wait_for_health(&registration.url).is_ok() {
+            let pid = registration.pid;
+            let generation = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst);
+            let stopping = Arc::new(AtomicBool::new(false));
+            *guard = Some(RunningHarness {
+                child: None,
+                pid,
+                url: registration.url.clone(),
+                stopping: stopping.clone(),
+                generation,
+                managed: registration.managed,
+            });
+            if let Ok(mut snapshot) = status.0.lock() {
+                snapshot.state = "ready".into();
+                snapshot.phase = "adopted".into();
+                snapshot.generation = generation;
+                snapshot.url = Some(registration.url.clone());
+                snapshot.pid = Some(pid);
+                snapshot.restart_count = 0;
+                snapshot.last_error = None;
+            }
+            // An adopted process has no Child handle to re-spawn from. It is
+            // monitored for liveness, but a later crash returns the app to a
+            // failed state and requires the normal Retry path.
+            monitor_harness(
+                state.0.clone(),
+                status.0.clone(),
+                PathBuf::new(),
+                Vec::new(),
+                paths.dsh_home.clone(),
+                log_path,
+                false,
+            );
+            return Ok(registration.url);
+        }
+    }
+    if let Some((url, pid)) = discover_external_harness() {
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst);
+        let stopping = Arc::new(AtomicBool::new(false));
+        *guard = Some(RunningHarness {
+            child: None,
+            pid,
+            url: url.clone(),
+            stopping: stopping.clone(),
+            generation,
+            managed: false,
+        });
+        if let Ok(mut snapshot) = status.0.lock() {
+            snapshot.state = "ready".into();
+            snapshot.phase = "adopted-external".into();
+            snapshot.generation = generation;
+            snapshot.url = Some(url.clone());
+            snapshot.pid = Some(pid);
+            snapshot.restart_count = 0;
+            snapshot.last_error = None;
+        }
+        monitor_harness(
+            state.0.clone(),
+            status.0.clone(),
+            PathBuf::new(),
+            Vec::new(),
+            paths.dsh_home.clone(),
+            log_path,
+            false,
+        );
+        return Ok(url);
+    }
     let mut recovered = false;
     let (program, args, child, url) = loop {
         let (program, args) = match dsh_command(app, &paths) {
             Ok(value) => value,
             Err(error) => {
-                if !recovered && recover_previous_runtime(&paths)? {
+                if !recovered
+                    && (recover_previous_runtime(&paths)? || recover_embedded_runtime(app, &paths)?)
+                {
                     recovered = true;
                     continue;
                 }
@@ -899,11 +1385,13 @@ fn start_harness(
         match spawn_harness(&program, &args, &paths.dsh_home, &log_path) {
             Ok((child, url)) => break (program, args, child, url),
             Err(error) => {
-                if !recovered && recover_previous_runtime(&paths)? {
+                if !recovered
+                    && (recover_previous_runtime(&paths)? || recover_embedded_runtime(app, &paths)?)
+                {
                     recovered = true;
                     log_line(
                         &log_path,
-                        &format!("current Runtime failed; recovered previous Runtime: {error}"),
+                        &format!("current Runtime failed; recovered previous/embedded Runtime: {error}"),
                     );
                     continue;
                 }
@@ -915,11 +1403,16 @@ fn start_harness(
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst);
     let stopping = Arc::new(AtomicBool::new(false));
     *guard = Some(RunningHarness {
-        child,
+        child: Some(child),
+        pid,
         url: url.clone(),
         stopping,
         generation,
+        managed: true,
     });
+    if let Err(error) = write_service_registration(&paths, &url, pid, true) {
+        log_line(&log_path, &format!("service registry write failed: {error}"));
+    }
     if let Ok(mut snapshot) = status.0.lock() {
         snapshot.state = "ready".into();
         snapshot.phase = "stable".into();
@@ -934,6 +1427,7 @@ fn start_harness(
         args,
         paths.dsh_home.clone(),
         log_path,
+        true,
     );
     Ok(url)
 }
@@ -945,6 +1439,16 @@ fn harness_url(
     status: State<'_, SupervisorStatusState>,
 ) -> Result<String, String> {
     start_harness(&app, &state, &status)
+}
+
+#[tauri::command]
+fn ensure_harness(
+    app: AppHandle,
+    state: State<'_, HarnessState>,
+    status: State<'_, SupervisorStatusState>,
+) -> Result<SupervisorStatus, String> {
+    start_harness(&app, &state, &status)?;
+    supervisor_status(status)
 }
 
 fn stop_harness_inner(state: &HarnessState, status: &SupervisorStatusState) -> Result<(), String> {
@@ -1018,6 +1522,49 @@ fn supervisor_retry(
 #[tauri::command]
 fn runtime_paths(app: AppHandle) -> Result<RuntimePaths, String> {
     app_paths(&app)
+}
+
+#[tauri::command]
+fn runtime_check_update(
+    app: AppHandle,
+    manifest_url: Option<String>,
+) -> Result<RuntimeUpdateInfo, String> {
+    let (parsed, candidate) = download_runtime_manifest(manifest_url)?;
+    let paths = app_paths(&app)?;
+    let current_path = PathBuf::from(&paths.runtime).join("current.json");
+    let current = fs::read_to_string(&current_path)
+        .ok()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+    let current_version = current
+        .as_ref()
+        .and_then(|value| value.get("runtimeVersion"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let candidate_version = candidate
+        .get("runtimeVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "runtime manifest is missing runtimeVersion".to_string())?
+        .to_owned();
+    let candidate_upstream_sha = candidate
+        .get("upstream")
+        .and_then(|value| value.get("sha"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Ok(RuntimeUpdateInfo {
+        available: current_version.as_deref() != Some(candidate_version.as_str()),
+        current_version,
+        candidate_version,
+        candidate_upstream_sha,
+        manifest_url: parsed.to_string(),
+        checked_at: runtime_check_timestamp(),
+    })
+}
+
+fn runtime_check_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| format!("unix:{}", value.as_secs()))
+        .unwrap_or_else(|_| "unknown".into())
 }
 
 fn runtime_tool(
@@ -1183,36 +1730,16 @@ fn runtime_update_from_url(
     manifest_url: String,
     allow_unsigned_local: Option<bool>,
 ) -> Result<String, String> {
-    let parsed = url::Url::parse(&manifest_url)
-        .map_err(|error| format!("invalid runtime manifest URL: {error}"))?;
-    let loopback_http =
-        parsed.scheme() == "http" && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"));
-    if parsed.scheme() != "https" && !(cfg!(debug_assertions) && loopback_http) {
-        return Err("runtime manifest URL must use HTTPS (loopback HTTP is debug-only)".into());
-    }
-    let response = reqwest::blocking::get(parsed.clone())
-        .map_err(|error| format!("runtime manifest download failed: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "runtime manifest download failed: HTTP {}",
-            response.status()
-        ));
-    }
-    if response.content_length().unwrap_or(0) > 1_048_576 {
-        return Err("runtime manifest is too large".into());
-    }
-    let bytes = response
-        .bytes()
-        .map_err(|error| format!("runtime manifest read failed: {error}"))?;
-    if bytes.len() > 1_048_576 {
-        return Err("runtime manifest is too large".into());
-    }
+    let (parsed, manifest) = download_runtime_manifest(Some(manifest_url))?;
     let paths = app_paths(&app)?;
     let manifest_path = PathBuf::from(&paths.app_data)
         .join("update")
         .join("runtime-manifest.json");
-    fs::write(&manifest_path, &bytes)
-        .map_err(|error| format!("unable to stage runtime manifest: {error}"))?;
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("unable to stage runtime manifest: {error}"))?;
     let mut base = parsed;
     let original_path = base.path().to_string();
     let directory = original_path
@@ -1429,12 +1956,17 @@ fn monitor_notifications(app: AppHandle, path: PathBuf) {
 fn monitor_tray_status(app: AppHandle, status: Arc<Mutex<SupervisorStatus>>) {
     let status_path = env::var_os("DSHPILOT_CI_STATUS_PATH").map(PathBuf::from);
     thread::spawn(move || loop {
-        if let Ok(snapshot) = status.lock() {
+        // Never hold the supervisor mutex while crossing into the GUI/tray
+        // event loop. On macOS set_tooltip can synchronously wait for the
+        // main thread; keeping the lock here deadlocks startup IPC against
+        // the background supervisor.
+        let snapshot = status.lock().ok().map(|value| value.clone());
+        if let Some(snapshot) = snapshot {
             if let Some(tray) = app.tray_by_id("dshpilot-tray") {
                 let _ = tray.set_tooltip(Some(format!("DSHPilot — {}", snapshot.state)));
             }
             if let Some(path) = status_path.as_ref() {
-                if let Ok(value) = serde_json::to_vec(&*snapshot) {
+                if let Ok(value) = serde_json::to_vec(&snapshot) {
                     if let Some(parent) = path.parent() {
                         let _ = fs::create_dir_all(parent);
                     }
@@ -1481,11 +2013,13 @@ pub fn run() {
         .manage(SupervisorStatusState::default())
         .invoke_handler(tauri::generate_handler![
             harness_url,
+            ensure_harness,
             stop_harness,
             supervisor_status,
             supervisor_restart,
             supervisor_retry,
             runtime_paths,
+            runtime_check_update,
             runtime_update,
             runtime_update_from_url,
             runtime_rollback,
@@ -1537,4 +2071,52 @@ pub fn run() {
                 app.exit(0);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_http_body_plain_content_length() {
+        let header = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n";
+        let body = b"{\"status\":\"ready\"}";
+        assert_eq!(decode_http_body(header, body), "{\"status\":\"ready\"}");
+    }
+
+    #[test]
+    fn decode_http_body_chunked_single_chunk() {
+        let header = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let body = b"12\r\n{\"status\":\"ready\"}\r\n0\r\n\r\n";
+        assert_eq!(decode_http_body(header, body), "{\"status\":\"ready\"}");
+    }
+
+    #[test]
+    fn decode_http_body_chunked_multiple_chunks() {
+        let header = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
+        let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(decode_http_body(header, body), "hello world");
+    }
+
+    #[test]
+    fn decode_http_body_chunked_case_insensitive_header() {
+        let header = "HTTP/1.1 200 OK\r\nTRANSFER-ENCODING: CHUNKED\r\n\r\n";
+        let body = b"4\r\nABCD\r\n0\r\n\r\n";
+        assert_eq!(decode_http_body(header, body), "ABCD");
+    }
+
+    #[test]
+    fn decode_http_body_chunked_with_trailing_crlf() {
+        let header = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let body = b"\r\n3\r\nabc\r\n0\r\n\r\n";
+        assert_eq!(decode_http_body(header, body), "abc");
+    }
+
+    #[test]
+    fn is_loopback_url_only_accepts_localhost() {
+        assert!(!is_loopback_url("http://192.168.1.5:3080"));
+        assert!(!is_loopback_url("http://example.com:3080"));
+        assert!(is_loopback_url("http://127.0.0.1:3080"));
+        assert!(!is_loopback_url("http://127.0.0.1"));
+    }
 }

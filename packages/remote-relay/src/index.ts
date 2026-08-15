@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer as createSecureServer } from 'node:https'
+import { randomUUID } from 'node:crypto'
 import { WebSocketServer, type RawData, type WebSocket } from 'ws'
 
 const PROTOCOL = 'dshpilot-relay-v1'
@@ -8,6 +9,7 @@ const MAX_CHANNELS = 1024
 const MAX_PEERS = 2
 const MAX_PAYLOAD = 4 * 1024 * 1024
 const RELAY_TOKEN_PATTERN = /^[A-Za-z0-9_-]{16,512}$/u
+const CHANNEL_ID_PATTERN = /^[A-Za-z0-9_-]{32,512}$/u
 
 export interface RemoteRelayServerOptions {
   host?: string
@@ -17,6 +19,12 @@ export interface RemoteRelayServerOptions {
   /** Optional path prefix, useful behind a reverse proxy. */
   pathPrefix?: string
   maxChannels?: number
+  /** Maximum lifetime of a channel, even if both peers stay connected. */
+  channelMaxAgeMs?: number
+  /** Remove an otherwise connected channel after this much inactivity. */
+  channelIdleTimeoutMs?: number
+  /** Time allowed for a peer to complete the hello+authenticate handshake. */
+  handshakeTimeoutMs?: number
   allowedHosts?: readonly string[]
   allowedOrigins?: readonly string[]
   tls?: { key: string | Buffer; cert: string | Buffer }
@@ -25,9 +33,11 @@ export interface RemoteRelayServerOptions {
 export interface RemoteRelayAddress { host: string; port: number }
 
 interface Peer { ws: WebSocket; role: 'desktop' | 'client' }
+interface Channel { peers: Map<string, Peer>; connectingRoles: Set<'desktop' | 'client'>; createdAt: number; lastActivityAt: number; nonce: string }
 interface Hello { type: 'hello'; protocol: 1; channelId: string; role: 'desktop' | 'client' }
+interface Authenticate { type: 'authenticate'; hmac: string }
 
-function bounded(value: string): boolean { return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value) }
+function bounded(value: string): boolean { return CHANNEL_ID_PATTERN.test(value) }
 function reject(response: ServerResponse, status: number, message: string): void { response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); response.end(JSON.stringify({ ok: false, error: message })) }
 function tokenFrom(request: IncomingMessage): string | undefined {
   const authorization = request.headers.authorization
@@ -41,6 +51,9 @@ function tokenMatches(expected: string, actual: string | undefined): boolean {
   if (actual === undefined) return false
   const left = createHash('sha256').update(expected).digest(); const right = createHash('sha256').update(actual).digest()
   return timingSafeEqual(left, right)
+}
+function channelHmac(token: string, channelId: string, nonce: string, role: 'desktop' | 'client'): string {
+  return createHmac('sha256', token).update(`${channelId}:${nonce}:${role}`).digest('base64')
 }
 function loopbackHost(value: string): boolean { return value === '127.0.0.1' || value === '::1' || value === 'localhost' || value === '::ffff:127.0.0.1' }
 function channelFromPath(pathname: string, prefix: string): string | undefined {
@@ -58,10 +71,11 @@ function channelFromPath(pathname: string, prefix: string): string | undefined {
  */
 export class RemoteRelayServer {
   private readonly options: Required<Pick<RemoteRelayServerOptions, 'host' | 'port' | 'pathPrefix'>> & RemoteRelayServerOptions
-  private readonly channels = new Map<string, Map<string, Peer>>()
+  private readonly channels = new Map<string, Channel>()
   private readonly http: Server
   private readonly sockets: WebSocketServer
   private addressValue?: RemoteRelayAddress
+  private sweepTimer?: ReturnType<typeof setInterval>
 
   constructor(options: RemoteRelayServerOptions = {}) {
     this.options = { host: '127.0.0.1', port: 0, pathPrefix: '', ...options }
@@ -77,11 +91,14 @@ export class RemoteRelayServer {
     const address = this.http.address()
     if (address === null || typeof address === 'string') throw new Error('relay address unavailable')
     this.addressValue = { host: address.address, port: address.port }
+    this.sweepTimer = setInterval(() => this.sweepChannels(), 60_000)
     return this.addressValue
   }
 
   async stop(): Promise<void> {
-    for (const peers of this.channels.values()) for (const peer of peers.values()) peer.ws.close(1001, 'relay shutting down')
+    if (this.sweepTimer !== undefined) clearInterval(this.sweepTimer)
+    this.sweepTimer = undefined
+    for (const channel of this.channels.values()) for (const peer of channel.peers.values()) peer.ws.close(1001, 'relay shutting down')
     this.channels.clear(); this.sockets.close()
     await new Promise<void>(resolve => this.http.close(() => resolve()))
   }
@@ -108,7 +125,12 @@ export class RemoteRelayServer {
         const sameOrigin = parsedOrigin.origin === new URL(`${scheme}//${request.headers.host ?? ''}`).origin
         if (!(this.options.allowedOrigins?.includes(origin) ?? false) && !sameOrigin) { socket.destroy(); return }
       }
-      const peers = this.channels.get(channelId) ?? new Map<string, Peer>()
+      const existing = this.channels.get(channelId)
+      if (existing !== undefined && this.channelExpired(existing)) {
+        for (const peer of existing.peers.values()) peer.ws.close(1001, 'relay channel expired')
+        this.channels.delete(channelId)
+      }
+      const peers = this.channels.get(channelId)?.peers ?? new Map<string, Peer>()
       if (!this.channels.has(channelId) && this.channels.size >= (this.options.maxChannels ?? MAX_CHANNELS)) { socket.destroy(); return }
       if (peers.size >= MAX_PEERS) { socket.destroy(); return }
       this.sockets.handleUpgrade(request, socket, head, ws => this.accept(channelId, ws))
@@ -117,37 +139,75 @@ export class RemoteRelayServer {
 
   private accept(channelId: string, ws: WebSocket): void {
     let hello: Hello | undefined
-    const peers = this.channels.get(channelId) ?? new Map<string, Peer>()
-    const connectionId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    let role: 'desktop' | 'client' | undefined
+    let authenticated = false
+    const isNew = !this.channels.has(channelId)
+    const channel: Channel = isNew
+      ? { peers: new Map<string, Peer>(), connectingRoles: new Set(), createdAt: Date.now(), lastActivityAt: Date.now(), nonce: randomBytes(32).toString('base64url') }
+      : this.channels.get(channelId)!
+    const peers = channel.peers
+    if (!isNew && !this.channels.has(channelId)) this.channels.set(channelId, channel)
+    this.channels.set(channelId, channel)
+    const now = Date.now()
+    channel.lastActivityAt = now
+    const connectionId = `${Date.now()}-${randomUUID()}`
+    let cleaned = false
     const cleanup = (): void => {
-      if (hello === undefined) clearTimeout(handshakeTimer)
-      const activePeers = this.channels.get(channelId) ?? peers
+      if (cleaned) return
+      cleaned = true
+      clearTimeout(handshakeTimer)
+      if (role !== undefined) channel.connectingRoles.delete(role)
+      const activePeers = this.channels.get(channelId)?.peers ?? peers
       activePeers.delete(connectionId)
-      if (activePeers.size === 0) this.channels.delete(channelId)
+      if (activePeers.size === 0 && channel.connectingRoles.size === 0) this.channels.delete(channelId)
     }
     const fail = (message: string): void => { ws.close(1008, message); cleanup() }
-    const handshakeTimer = setTimeout(() => { if (hello === undefined) fail('relay hello timeout') }, 10_000)
+    const handshakeTimer = setTimeout(() => { if (!authenticated) fail('relay handshake timeout') }, this.options.handshakeTimeoutMs ?? 10_000)
     let rateWindow = Date.now(); let rateCount = 0
     const onMessage = (data: RawData): void => {
       try {
         if (Date.now() - rateWindow >= 1_000) { rateWindow = Date.now(); rateCount = 0 }
         rateCount += 1; if (rateCount > 120) throw new Error('relay rate limit exceeded')
+        channel.lastActivityAt = Date.now()
         const bytes = Buffer.isBuffer(data) ? data : Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data)
         if (bytes.byteLength > MAX_PAYLOAD) throw new Error('relay frame exceeds 4 MiB')
+        const text = bytes.toString('utf8')
         if (hello === undefined) {
-          const value = JSON.parse(bytes.toString('utf8')) as Partial<Hello>
+          const value = JSON.parse(text) as Partial<Hello>
           if (value.type !== 'hello' || value.protocol !== 1 || value.channelId !== channelId || (value.role !== 'desktop' && value.role !== 'client')) throw new Error('relay hello is invalid')
-          const activePeers = this.channels.get(channelId) ?? peers
-          if ([...activePeers.values()].some(peer => peer.role === value.role)) throw new Error('relay role is already connected')
-          hello = value as Hello; clearTimeout(handshakeTimer); activePeers.set(connectionId, { ws, role: hello.role }); this.channels.set(channelId, activePeers)
-          ws.send(JSON.stringify({ type: 'ready', protocol: 1, channelId, role: hello.role }))
+          if (peers.has(value.role) || channel.connectingRoles.has(value.role)) throw new Error('relay role is already connected')
+          hello = value as Hello; role = hello.role; channel.connectingRoles.add(hello.role)
+          ws.send(JSON.stringify({ type: 'ready', protocol: 1, channelId, role: hello.role, nonce: channel.nonce }))
           return
         }
-        const activePeers = this.channels.get(channelId) ?? peers
-        for (const [id, peer] of activePeers) if (id !== connectionId && peer.ws.readyState === peer.ws.OPEN) peer.ws.send(bytes)
+        if (!authenticated) {
+          const value = JSON.parse(text) as Partial<Authenticate>
+          if (value.type !== 'authenticate' || typeof value.hmac !== 'string' || role === undefined) throw new Error('relay authenticate is required')
+          const expected = Buffer.from(channelHmac(this.options.token as string, channelId, channel.nonce, role))
+          const supplied = Buffer.from(value.hmac)
+          if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) throw new Error('relay authentication failed')
+          authenticated = true; peers.set(connectionId, { ws, role }); clearTimeout(handshakeTimer)
+          ws.send(JSON.stringify({ type: 'authenticated', protocol: 1, channelId, role }))
+          return
+        }
+        for (const [id, peer] of peers) if (id !== connectionId && peer.ws.readyState === peer.ws.OPEN) peer.ws.send(bytes)
       } catch { fail('invalid relay frame') }
     }
     ws.on('message', onMessage); ws.on('close', cleanup); ws.on('error', cleanup)
+  }
+
+  private channelExpired(channel: Channel): boolean {
+    const now = Date.now()
+    return now - channel.createdAt > (this.options.channelMaxAgeMs ?? 24 * 60 * 60 * 1000)
+      || now - channel.lastActivityAt > (this.options.channelIdleTimeoutMs ?? 60 * 60 * 1000)
+  }
+
+  private sweepChannels(): void {
+    for (const [channelId, channel] of this.channels) {
+      if (!this.channelExpired(channel)) continue
+      for (const peer of channel.peers.values()) peer.ws.close(1001, 'relay channel expired')
+      this.channels.delete(channelId)
+    }
   }
 }
 
@@ -161,4 +221,6 @@ export function relayWebSocketUrl(options: RelayPeerOptions): string {
 }
 
 export function relayHello(options: RelayPeerOptions): string { return JSON.stringify({ type: 'hello', protocol: 1, channelId: options.channelId, role: options.role }) }
+export function relayAuthenticate(options: RelayPeerOptions, nonce: string): string { return JSON.stringify({ type: 'authenticate', hmac: channelHmac(options.token ?? '', options.channelId, nonce, options.role) }) }
 export const relayProtocol = PROTOCOL
+export const relayChannelIdPattern = CHANNEL_ID_PATTERN

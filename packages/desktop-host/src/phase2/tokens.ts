@@ -6,6 +6,12 @@ export interface TokenUsage {
   cachedTokens?: number
   totalTokens?: number
   contextWindow?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  projectedTokens?: number
+  systemTokens?: number
+  toolsTokens?: number
+  messageTokens?: number
   source: TokenSource
   estimate: boolean
 }
@@ -34,14 +40,25 @@ export function parseOfficialUsage(value: unknown): TokenUsage | undefined {
   if (typeof value !== 'object' || value === null) return undefined
   const root = value as Record<string, unknown>
   const usage = typeof root.usage === 'object' && root.usage !== null ? root.usage as Record<string, unknown> : root
-  const inputTokens = firstNumber(usage, ['inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens'])
+  const projection = typeof root.tokenUsage === 'object' && root.tokenUsage !== null ? root.tokenUsage as Record<string, unknown> : undefined
+  const pressure = typeof root.contextPressure === 'object' && root.contextPressure !== null ? root.contextPressure as Record<string, unknown> : undefined
+  const breakdown = typeof root.contextBreakdown === 'object' && root.contextBreakdown !== null ? root.contextBreakdown as Record<string, unknown> : undefined
+  const cacheReadTokens = firstNumber(usage, ['cacheReadTokens', 'cache_read_tokens', 'cacheReadInputTokens', 'cache_read_input_tokens']) ?? firstNumber(projection ?? {}, ['cacheReadTokens'])
+  const cacheWriteTokens = firstNumber(usage, ['cacheWriteTokens', 'cache_write_tokens']) ?? firstNumber(projection ?? {}, ['cacheWriteTokens'])
+  const projectedInput = projection === undefined ? undefined : (firstNumber(projection, ['uncachedInputTokens']) ?? 0) + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0)
+  const inputTokens = firstNumber(usage, ['inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens']) ?? (projectedInput === 0 ? undefined : projectedInput)
   const outputTokens = firstNumber(usage, ['outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens'])
-  const cachedTokens = firstNumber(usage, ['cachedTokens', 'cached_tokens', 'cacheReadTokens', 'cache_read_tokens', 'cacheReadInputTokens', 'cache_read_input_tokens'])
+  const cachedTokens = firstNumber(usage, ['cachedTokens', 'cached_tokens']) ?? cacheReadTokens
   const contextWindow = firstNumber(root, ['contextWindow', 'context_window', 'maxContextTokens', 'max_context_tokens'])
-    ?? firstNumber(usage, ['contextWindow', 'context_window'])
-  if (inputTokens === undefined && outputTokens === undefined && cachedTokens === undefined && contextWindow === undefined) return undefined
+    ?? firstNumber(usage, ['contextWindow', 'context_window']) ?? firstNumber(pressure ?? {}, ['contextWindow'])
+  if (inputTokens === undefined && outputTokens === undefined && cachedTokens === undefined && contextWindow === undefined && projectedInput === undefined) return undefined
   const totalTokens = firstNumber(usage, ['totalTokens', 'total_tokens']) ?? (inputTokens === undefined && outputTokens === undefined ? undefined : (inputTokens ?? 0) + (outputTokens ?? 0))
-  return { inputTokens, outputTokens, cachedTokens, totalTokens, contextWindow, source: 'official', estimate: false }
+  return {
+    inputTokens, outputTokens, cachedTokens, totalTokens, contextWindow, cacheReadTokens, cacheWriteTokens,
+    projectedTokens: firstNumber(pressure ?? {}, ['projectedTokens']),
+    systemTokens: firstNumber(breakdown ?? {}, ['systemTokens']), toolsTokens: firstNumber(breakdown ?? {}, ['toolsTokens']), messageTokens: firstNumber(breakdown ?? {}, ['messageTokens']),
+    source: 'official', estimate: false,
+  }
 }
 
 /** Conservative, clearly-labelled token estimate for inspection UI only. */

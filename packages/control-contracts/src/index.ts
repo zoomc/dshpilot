@@ -18,6 +18,7 @@ export type ControlEventType =
   | 'document.changed'
   | 'notification.emitted'
   | 'task.updated'
+  | 'job.interrupted'
   | 'notification.created'
   | 'device.paired'
   | 'device.revoked'
@@ -49,6 +50,7 @@ export interface SessionSummary {
   sessionId: string
   title?: string
   cwd?: string
+  workspaceId?: string
   status: 'idle' | 'running' | 'waiting' | 'failed' | 'closed'
   updatedAt: string
 }
@@ -56,6 +58,7 @@ export interface SessionSummary {
 export interface TaskSummary {
   taskId: string
   sessionId?: string
+  workspaceId?: string
   status: 'queued' | 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled'
   title?: string
   updatedAt: string
@@ -64,6 +67,7 @@ export interface TaskSummary {
 export interface PermissionSummary {
   permissionId: string
   sessionId?: string
+  workspaceId?: string
   tool?: string
   description?: string
   status: 'pending' | 'allowed' | 'denied' | 'expired'
@@ -75,6 +79,8 @@ export interface DeviceInfo {
   deviceId: string
   name: string
   scopes: readonly ControlScope[]
+  /** Empty means all workspaces for backwards-compatible local devices. */
+  workspaceIds?: readonly string[]
   /** Ed25519 public key registered during pairing. Legacy devices may omit it. */
   identityPublicKey?: string
   createdAt: string
@@ -92,6 +98,7 @@ export interface PairingOffer {
   code: string
   nonce: string
   expiresAt: string
+  workspaceIds?: readonly string[]
   relayEndpoint?: string
 }
 
@@ -99,6 +106,7 @@ export interface DevicePairingRequest {
   code: string
   name: string
   scopes?: readonly ControlScope[]
+  workspaceIds?: readonly string[]
   offerId?: string
   serverId?: string
   serverPublicKey?: string

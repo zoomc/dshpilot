@@ -1,9 +1,9 @@
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { LocalDocumentProvider, McpManager } from '@dshpilot/desktop-host'
-import { apply, liveMcpRecords, projectHarnessEvent, reconcileMcpLoader, restartMcpLoader } from './index.js'
+import { apply, liveMcpRecords, projectHarnessEvent, readBoundedFile, reconcileMcpLoader, resolvePublicAddresses, restartMcpLoader } from './index.js'
 
 interface FixtureEntry {
   id: string
@@ -100,5 +100,31 @@ describe('DSHPilot Host plugin document tool seam', () => {
     const event = projectHarnessEvent({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'answer sk-test-secret-1234567890 token=hidden-value' }] } } })
     expect(event).toMatchObject({ kind: 'assistant/message', text: expect.stringContaining('[redacted-secret]') })
     expect(event.text).not.toContain('hidden-value')
+  })
+})
+
+describe('DSHPilot Host plugin filesystem and DNS seam hardening', () => {
+  it('streams a file and never returns more than the requested byte cap', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'dshpilot-bounded-')); const target = join(home, 'big.bin')
+    const payload = 'x'.repeat(64 * 1024) + 'y'.repeat(64 * 1024) // 128 KiB of data
+    await writeFile(target, payload, 'utf8')
+    const limit = 4096
+    const result = await readBoundedFile(target, 0, limit)
+    expect(result.truncated).toBe(true)
+    expect(result.content.length).toBeLessThanOrEqual(limit)
+    expect(result.content).toBe(payload.slice(0, limit))
+    // An offset in the middle stays capped relative to the start of the read.
+    const sliced = await readBoundedFile(target, 4096, limit)
+    expect(sliced.truncated).toBe(true)
+    expect(sliced.content.length).toBeLessThanOrEqual(limit)
+    expect(sliced.content).toBe(payload.slice(4096, 4096 + limit))
+  })
+
+  it('rejects private/loopback hostnames so a URL resource cannot resolve to an internal address', async () => {
+    await expect(resolvePublicAddresses('127.0.0.1')).rejects.toThrow(/private or loopback/i)
+    await expect(resolvePublicAddresses('10.0.0.5')).rejects.toThrow(/private or loopback/i)
+    await expect(resolvePublicAddresses('192.168.1.1')).rejects.toThrow(/private or loopback/i)
+    await expect(resolvePublicAddresses('::1')).rejects.toThrow(/private or loopback/i)
+    await expect(resolvePublicAddresses('fc00::1')).rejects.toThrow(/private or loopback/i)
   })
 })

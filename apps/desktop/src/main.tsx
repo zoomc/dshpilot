@@ -40,6 +40,10 @@ function App() {
   useEffect(() => {
     let cancelled = false
     void checkForAppUpdate().then(value => { if (!cancelled) setUpdateState(value) })
+    // The Tauri setup hook starts the managed Harness, while this explicit
+    // preflight also covers a window restored after a supervisor failure or
+    // an already-running registered dsh service.
+    void invoke<SupervisorStatus>('ensure_harness').then(value => { if (!cancelled) setStatus(value) }).catch(error => { if (!cancelled) setStatus(current => ({ ...current, state: 'failed', phase: 'preflight', last_error: String(error) })) })
     const poll = (): void => { void invoke<SupervisorStatus>('supervisor_status').then(value => { if (!cancelled) setStatus(value) }).catch(() => undefined) }
     poll(); const timer = window.setInterval(poll, 500)
     return () => { cancelled = true; window.clearInterval(timer) }
@@ -85,6 +89,11 @@ function App() {
   const installUpdate = (): void => {
     if (updateState.state !== 'available') return
     const update = updateState.update
+    // Per the update contract, confirm before restarting when a Harness session
+    // may be in flight. A running supervisor means the user already navigated
+    // into the Harness, so an active session is plausible and interruption must
+    // be acknowledged.
+    if (status.state === 'ready' && !window.confirm('安装应用更新将重启 DSHPilot，进行中的 Harness 会话会中断。确认继续？')) return
     void installAppUpdateSafely(update, setUpdateState).catch(error => setUpdateState({ state: 'failed', error: error instanceof Error ? error.message : String(error) }))
   }
   return <main style={{ fontFamily: 'system-ui', padding: 32 }}>

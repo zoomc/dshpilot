@@ -20,6 +20,10 @@ export async function checkForAppUpdate(): Promise<AppUpdateState> {
 export async function installAppUpdate(update: Update, onProgress?: (state: AppUpdateState) => void): Promise<void> {
   let downloaded = 0
   onProgress?.({ state: 'downloading', downloaded })
+  // `downloadAndInstall` downloads, installs, and (on Tauri v2) automatically
+  // relaunches the app once the new binary is in place — this closes the P0
+  // "no reliable relaunch" gap. We explicitly stop the managed Harness first
+  // (see installAppUpdateSafely) so the restart never strands a live session.
   await update.downloadAndInstall(event => {
     if (event.event === 'Started') { onProgress?.({ state: 'downloading', downloaded: 0, total: event.data.contentLength ?? undefined }); return }
     if (event.event === 'Progress') { downloaded += event.data.chunkLength; onProgress?.({ state: 'downloading', downloaded }); return }

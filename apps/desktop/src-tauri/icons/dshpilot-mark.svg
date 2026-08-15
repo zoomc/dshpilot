@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">DSHPilot mark</title>
+  <desc id="desc">A simplified pilot-whale mark with a DeepSeek-like silhouette and a violet-cyan DSHPilot palette.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#17114d"/>
+      <stop offset="0.55" stop-color="#20106b"/>
+      <stop offset="1" stop-color="#080d2d"/>
+    </linearGradient>
+    <linearGradient id="whale" x1="0.12" y1="0.1" x2="0.88" y2="0.85">
+      <stop offset="0" stop-color="#b7fff5"/>
+      <stop offset="0.26" stop-color="#5fe8e3"/>
+      <stop offset="0.62" stop-color="#6255f4"/>
+      <stop offset="1" stop-color="#3422b8"/>
+    </linearGradient>
+    <linearGradient id="fin" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7af5ea"/>
+      <stop offset="1" stop-color="#4c3fe0"/>
+    </linearGradient>
+    <filter id="softGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="14" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" rx="232" fill="url(#bg)"/>
+  <path d="M144 754c128 91 282 126 451 104 105-14 194-49 279-108" fill="none" stroke="#655dff" stroke-opacity=".22" stroke-width="22" stroke-linecap="round"/>
+
+  <!-- A single, rounded pilot-whale silhouette: the lifted tail is the DeepSeek cue. -->
+  <path d="M304 447C301 337 395 248 526 235c146-15 280 55 330 167 42 94 19 207-62 285-77 74-202 104-327 75-137-31-239-111-268-217-21-78 12-142 105-194Z" fill="url(#whale)" filter="url(#softGlow)"/>
+  <path d="M323 448C246 428 166 377 112 294c91-19 180 16 249 91-28 15-41 37-38 63Z" fill="url(#fin)"/>
+  <path d="M332 430c-60-72-84-165-55-250 76 46 119 117 126 201-27 9-50 25-71 49Z" fill="#4a38d0"/>
+  <path d="M401 691c39 38 93 66 161 83-23 55-67 83-133 84 15-55 6-111-28-167Z" fill="url(#fin)"/>
+  <path d="M287 560c104 87 252 116 395 79 65-17 119-46 159-86-40 91-133 150-259 166-138 17-262-15-344-88-20-18-29-38-28-61 22 6 48 3 77-10Z" fill="#21158f" fill-opacity=".48"/>
+  <path d="M604 332c95 19 169 76 207 157-55-37-119-52-190-38-26 5-51 14-75 27 18-58 37-106 58-146Z" fill="#d4fff9" fill-opacity=".52"/>
+
+  <circle cx="748" cy="456" r="24" fill="#120b55"/>
+  <circle cx="753" cy="450" r="9" fill="#eaffff"/>
+  <path d="M799 517c-24 17-52 22-83 14" fill="none" stroke="#17105f" stroke-width="13" stroke-linecap="round"/>
+  <path d="M442 295c38-18 75-24 111-18" fill="none" stroke="#e5fffb" stroke-opacity=".7" stroke-width="13" stroke-linecap="round"/>
+  <circle cx="836" cy="254" r="12" fill="#9ffff2"/>
+  <circle cx="879" cy="217" r="6" fill="#6f66ff"/>
+</svg>

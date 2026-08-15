@@ -42,7 +42,13 @@ export class RemoteRelayChannel {
     socket.addEventListener('open', () => { this.reconnectBackoff = 500; socket.send(JSON.stringify({ type: 'hello', protocol: 1, channelId: this.options.channelId, role: this.options.role })) })
     socket.addEventListener('message', event => {
       if (typeof event.data === 'string') {
-        try { const value = JSON.parse(event.data) as { type?: string; protocol?: number; channelId?: string }; if (value.type === 'ready' && value.protocol === 1 && value.channelId === this.options.channelId) { this.readyState = true; this.readyResolve(); return } } catch { /* opaque application frame */ }
+        let value: { type?: string; protocol?: number; channelId?: string; nonce?: string } = {}
+        try { value = JSON.parse(event.data) } catch { /* opaque application frame */ }
+        if (value.type === 'ready' && value.protocol === 1 && value.channelId === this.options.channelId) {
+          if (typeof value.nonce === 'string') void this.sendAuthenticate(value.nonce).catch(() => this.readyReject(new Error('relay authenticate failed')))
+          return
+        }
+        if (value.type === 'authenticated' && value.protocol === 1 && value.channelId === this.options.channelId) { this.readyState = true; this.readyResolve(); return }
         const encoded = new TextEncoder().encode(event.data); for (const listener of this.listeners) listener(encoded); return
       }
       if (event.data instanceof ArrayBuffer) { const frame = new Uint8Array(event.data); for (const listener of this.listeners) listener(frame) }
@@ -54,6 +60,15 @@ export class RemoteRelayChannel {
     if (this.closed || this.reconnectTimer !== undefined) return
     const delay = this.reconnectBackoff; this.reconnectBackoff = Math.min(this.reconnectBackoff * 2, 30_000)
     this.reconnectTimer = setTimeout(() => { this.reconnectTimer = undefined; this.connect() }, delay)
+  }
+  private async sendAuthenticate(nonce: string): Promise<void> {
+    const token = this.options.token ?? ''
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(token), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+    const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${this.options.channelId}:${nonce}:${this.options.role}`))
+    const bytes = new Uint8Array(signature)
+    let hmac = ''
+    for (const byte of bytes) hmac += String.fromCharCode(byte)
+    this.socket.send(JSON.stringify({ type: 'authenticate', hmac: btoa(hmac) }))
   }
   async ready(): Promise<void> {
     if (this.closed) throw new Error('relay channel is closed')
