@@ -8,6 +8,7 @@
 - Restored app relaunch after a Tauri auto-update by relying on the updater's built-in restart and confirming before interrupting an active session.
 - Added embedded-Runtime recovery so a corrupt current + previous Runtime still boots from the bundled seed.
 - Bundled the Runtime into the default macOS app build via `tauri.conf.json` resources.
+- Built the DSHPilot Client Plugin as an official Harness CJS closure-factory bundle (tsdown `clientConfig`): `window.__ModuleLoader__.load({ id, factory })` registration, `react`/platform seed modules externalized through the loader module table, `@tauri-apps/*` inlined; replaced the prior plain-ESM output that failed to register in the WebView. Added a real loader-contract test that builds and loads the bundle.
 - Closed remote workspace-scoping gaps: events (`/v1/events`, `/v1/events/stream`, and the control-protocol `events` request) are now filtered to a device's paired workspaces via session→workspace resolution; artifact/resource get-by-id enforces item workspace scope (fail-closed). Relay channel ownership + nonce/HMAC and a DNS-rebinding pin were added, streaming reads bound to the owner, daemon persistence and stale-job interruption hardened.
 - Added negative tests proving a workspace-scoped device cannot read another workspace's events or artifact/resource by id without an explicit, allowed selector.
 

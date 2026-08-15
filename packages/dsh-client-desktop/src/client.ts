@@ -179,17 +179,8 @@ export function apply(ctx: { slots: { inject(key: string, setup: () => unknown):
 export const plugin = { name, inject, apply }
 export default plugin
 
-/**
- * Official packaged-plugin handoff: when the bundle runs inside the Harness
- * web shell, register the surface through the page's `__ModuleLoader__` sink
- * (the contract the Cordis client runner reads). Guarded so the same module
- * still loads as a plain ESM in Node (smoke/test) without touching `window`.
- */
-declare global {
-  interface Window {
-    __ModuleLoader__?: { load(handoff: { id: string; factory: () => unknown }): void }
-  }
-}
-if (typeof window !== 'undefined' && typeof window.__ModuleLoader__ === 'object' && window.__ModuleLoader__ !== null) {
-  window.__ModuleLoader__.load({ id: '@dshpilot/dsh-client-desktop', factory: () => plugin })
-}
+// NOTE: registration with the Harness web-shell module loader is performed by
+// the tsdown bundle wrapper (see tsdown.config.ts — it emits the
+// `window.__ModuleLoader__.load({ id, factory })` closure around this module).
+// Do NOT re-register here: the wrapper already does it, and a second call would
+// throw "duplicate" in the Cordis client runner.
