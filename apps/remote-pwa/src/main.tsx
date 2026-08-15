@@ -1,12 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { RemoteControlClient } from '@dshpilot/remote-client'
-import type { ControlEvent, PermissionSummary, ServerInfo, SessionSummary } from '@dshpilot/control-contracts'
+import type { ControlEvent, PairingOffer, PermissionSummary, ServerInfo, SessionSummary } from '@dshpilot/control-contracts'
 
 const saved = (key: string): string => key === 'dshpilot.endpoint' ? localStorage.getItem(key) ?? '' : sessionStorage.getItem(key) ?? ''
 const persist = (key: string, value: string): void => { (key === 'dshpilot.endpoint' ? localStorage : sessionStorage).setItem(key, value) }
 function cached<T>(key: string, fallback: T): T { try { const value = localStorage.getItem(key); return value === null ? fallback : JSON.parse(value) as T } catch { return fallback } }
 function cache<T>(key: string, value: T): void { try { localStorage.setItem(key, JSON.stringify(value)) } catch { /* offline cache is best effort and never blocks remote control */ } }
+function parsePairingOffer(value: string): PairingOffer | undefined {
+  try {
+    const offer = JSON.parse(value) as Partial<PairingOffer>
+    if (offer.schemaVersion !== 1 || typeof offer.offerId !== 'string' || typeof offer.serverId !== 'string' || typeof offer.publicKey !== 'string' || typeof offer.code !== 'string' || typeof offer.nonce !== 'string' || typeof offer.expiresAt !== 'string') return undefined
+    return offer as PairingOffer
+  } catch { return undefined }
+}
 
 type PendingQuestion = { rpcId: string; sessionId: string; questions: Array<{ id: string; question: string; options: Array<{ label: string; description?: string }>; multiSelect: boolean }> }
 type QuestionDraft = { selected: string[]; custom: string }
@@ -19,6 +26,7 @@ function App() {
   const [refreshToken, setRefreshToken] = useState(saved('dshpilot.refresh'))
   const [deviceId, setDeviceId] = useState(saved('dshpilot.device'))
   const [pairCode, setPairCode] = useState('')
+  const [pairingOffer, setPairingOffer] = useState<PairingOffer | undefined>()
   const [pairName, setPairName] = useState('Remote PWA')
   const [server, setServer] = useState<ServerInfo | undefined>()
   const [events, setEvents] = useState<ControlEvent[]>(() => cached('dshpilot.remote.events', []))
@@ -67,8 +75,12 @@ function App() {
     const answers = pending.questions.map(question => { const draft = questionDrafts[`${pending.rpcId}:${question.id}`] ?? { selected: [], custom: '' }; return { id: question.id, selected: draft.selected, ...(draft.custom.trim() === '' ? {} : { custom: draft.custom.trim() }) } })
     void client.control({ kind: 'question_reply', requestId: crypto.randomUUID(), rpcId: pending.rpcId, sessionId: pending.sessionId, answers }).then(() => { setQuestions(current => current.filter(item => item.rpcId !== pending.rpcId)); setQuestionDrafts(current => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${pending.rpcId}:`)))) }).catch(value => setError(value instanceof Error ? value.message : String(value)))
   }
-  const createPairingOffer = (): void => { void client.pairingOffer().then(offer => setPairCode(offer.code)).catch(value => setError(value instanceof Error ? value.message : String(value))) }
-  const completePairing = (): void => { void client.pair(pairCode, pairName).then(result => { setToken(result.token); setRefreshToken(result.refreshToken); setDeviceId(result.device.deviceId); persist('dshpilot.token', result.token); persist('dshpilot.refresh', result.refreshToken); persist('dshpilot.device', result.device.deviceId); connectClient(new RemoteControlClient({ baseUrl: endpoint, token: result.token, refreshToken: result.refreshToken, deviceId: result.device.deviceId })) }).catch(value => setError(value instanceof Error ? value.message : String(value))) }
+  const createPairingOffer = (): void => { void client.pairingOffer().then(offer => { setPairingOffer(offer); setPairCode(offer.code) }).catch(value => setError(value instanceof Error ? value.message : String(value))) }
+  const completePairing = (): void => {
+    const pastedOffer = parsePairingOffer(pairCode.trim()); const offer = pastedOffer ?? pairingOffer; const code = offer?.code ?? pairCode.trim()
+    if (code === '') { setError('请输入 pairing code 或完整 pairing offer JSON'); return }
+    void client.pair(code, pairName, offer).then(result => { setToken(result.token); setRefreshToken(result.refreshToken); setDeviceId(result.device.deviceId); persist('dshpilot.token', result.token); persist('dshpilot.refresh', result.refreshToken); persist('dshpilot.device', result.device.deviceId); connectClient(new RemoteControlClient({ baseUrl: endpoint, token: result.token, refreshToken: result.refreshToken, deviceId: result.device.deviceId })) }).catch(value => setError(value instanceof Error ? value.message : String(value)))
+  }
   const inspectSession = (sessionId: string): void => { setSelectedSessionId(sessionId); void client.lineage<{ sessionId: string; parentSessionId?: string }>(sessionId).then(setLineage).catch(value => setError(value instanceof Error ? value.message : String(value))); const cwd = sessions.find(session => session.sessionId === sessionId)?.cwd; if (cwd !== undefined) void client.git<{ branch?: string; status?: string; diff?: string; commit?: string }>(cwd).then(setGitSummary).catch(value => setError(value instanceof Error ? value.message : String(value))) }
   const downloadArtifact = (artifactId: string, name: string): void => { void client.artifactRead(artifactId).then(bytes => { const link = document.createElement('a'); const body = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer; link.href = URL.createObjectURL(new Blob([body])); link.download = name; link.click(); URL.revokeObjectURL(link.href) }).catch(value => setError(value instanceof Error ? value.message : String(value))) }
   useEffect(() => { if (token) connect(); return () => streamAbort.current?.abort() }, [])
@@ -77,7 +89,7 @@ function App() {
   return <main style={{ maxWidth: 860, margin: '0 auto', padding: 24, fontFamily: 'system-ui' }}>
     <h1>DSHPilot Remote</h1><p>Self-hosted, restricted control plane. The PWA never receives the Harness process or OS credentials.</p>
     <section style={{ display: 'grid', gap: 8 }}><input value={endpoint} onChange={event => setEndpoint(event.target.value)} placeholder="https://host:port" /><input value={token} onChange={event => setToken(event.target.value)} placeholder="access token" type="password" /><input value={deviceId} onChange={event => setDeviceId(event.target.value)} placeholder="device id for refresh" /><input value={refreshToken} onChange={event => setRefreshToken(event.target.value)} placeholder="refresh token" type="password" /><button type="button" onClick={connect}>Connect</button></section>
-    <section style={{ display: 'grid', gap: 8 }}><h2>Pair a device</h2><input value={pairName} onChange={event => setPairName(event.target.value)} placeholder="device name" /><button type="button" onClick={createPairingOffer}>Create local pairing offer</button><input value={pairCode} onChange={event => setPairCode(event.target.value)} placeholder="one-time pairing code" /><button type="button" onClick={completePairing}>Complete pairing</button></section>
+    <section style={{ display: 'grid', gap: 8 }}><h2>Pair a device</h2><input value={pairName} onChange={event => setPairName(event.target.value)} placeholder="device name" /><button type="button" onClick={createPairingOffer}>Create local pairing offer</button><input value={pairCode} onChange={event => { setPairCode(event.target.value); setPairingOffer(undefined) }} placeholder="one-time code or pairing offer JSON" /><button type="button" onClick={completePairing}>Complete pairing</button></section>
     {server !== undefined && <section><h2>{server.name}</h2><p>Server {server.serverId} · protocol v{server.protocolVersion} · {server.remoteEnabled ? 'remote enabled' : 'loopback only'}</p></section>}
     <section><h2>Sessions ({sessions.length})</h2><select value={selectedSessionId} onChange={event => inspectSession(event.target.value)}><option value="">New session</option>{sessions.map(session => <option key={session.sessionId} value={session.sessionId}>{session.sessionId} · {session.status}</option>)}</select> <button type="button" onClick={cancelSession} disabled={!selectedSessionId}>Cancel selected</button>{lineage.length > 0 && <p>Lineage: {lineage.map(item => item.sessionId).join(' → ')}</p>}{gitSummary !== undefined && <pre>{`${gitSummary.commit ?? ''}\n${gitSummary.branch ?? ''}\n${gitSummary.status ?? ''}\n${gitSummary.diff ?? ''}`}</pre>}</section>
     <section><h2>Prompt admission</h2><select value={mode} onChange={event => setMode(event.target.value as 'queue' | 'steer')}><option value="queue">Queue</option><option value="steer">Steer current turn</option></select><textarea value={prompt} onChange={event => setPrompt(event.target.value)} rows={4} style={{ width: '100%' }} placeholder="This is admitted as a restricted request; execution remains Harness-owned." /><button type="button" onClick={sendPrompt}>Send</button></section>

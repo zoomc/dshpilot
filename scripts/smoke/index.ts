@@ -16,6 +16,18 @@ function readinessUrl(line: string): string | undefined {
   return value
 }
 
+async function rpc<T>(baseUrl: string, method: string, payload: unknown): Promise<T> {
+  const response = await fetch(`${baseUrl}/api/${method}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'client-request', rpcId: `dshpilot-smoke-${method}`, method, payload }),
+  })
+  if (!response.ok) throw new Error(`${method} failed over HTTP ${response.status}: ${await response.text()}`)
+  const envelope = await response.json() as { result?: { ok?: boolean; value?: T; error?: { code?: string; message?: string } } }
+  if (envelope.result?.ok !== true) throw new Error(`${method} failed: ${envelope.result?.error?.code ?? 'unknown'}: ${envelope.result?.error?.message ?? 'unknown error'}`)
+  return envelope.result.value as T
+}
+
 async function main(): Promise<void> {
   const runtimeRoot = process.env.DSHPILOT_RUNTIME_ROOT === undefined ? undefined : resolve(process.env.DSHPILOT_RUNTIME_ROOT)
   const home = await mkdtemp(join(tmpdir(), 'dshpilot-smoke-'))
@@ -79,6 +91,20 @@ async function main(): Promise<void> {
   if (!response.ok) throw new Error(`Harness readiness URL returned HTTP ${response.status}`)
   const html = await response.text()
   if (!html.includes('<!doctype html>')) throw new Error('Harness Web UI did not return HTML')
+
+  // Exercise the official, keyless-safe Host API seams. These calls create no
+  // model turn, but prove that the Web UI can list/create/read sessions,
+  // describe settings, and resolve the model catalog after a real boot.
+  const before = await rpc<{ items?: unknown[] }>(url, 'session.list', {})
+  const created = await rpc<{ sessionId?: string }>(url, 'session.create', {})
+  if (typeof created.sessionId !== 'string' || created.sessionId.length === 0) throw new Error('Harness session.create returned no sessionId')
+  const after = await rpc<{ items?: Array<{ sessionId?: string }> }>(url, 'session.list', {})
+  if (!Array.isArray(before.items) || !after.items?.some(item => item.sessionId === created.sessionId)) throw new Error('Harness session.list did not expose the created session')
+  await rpc(url, 'session.history', { sessionId: created.sessionId, maxMessages: 10 })
+  await rpc(url, 'session.models', { sessionId: created.sessionId })
+  await rpc(url, 'llm.models', {})
+  const settings = await rpc<{ namespaces?: unknown[] }>(url, 'settings.describe', {})
+  if (!Array.isArray(settings.namespaces)) throw new Error('Harness settings.describe returned no namespace projection')
   let hostPluginLoaded = false
   if (runtimeRoot) {
     const health = await fetch(`${url}/__dshpilot/health`)
@@ -87,6 +113,9 @@ async function main(): Promise<void> {
     const pluginStatus = await status.json() as { hostPlugin?: boolean; officialServices?: { webServer?: boolean; apiProxy?: boolean; tools?: boolean }; documentTools?: string[] }
     hostPluginLoaded = status.ok && pluginStatus.hostPlugin === true && pluginStatus.officialServices?.tools === true && pluginStatus.documentTools?.length === 6
     if (!hostPluginLoaded) throw new Error('Packaged DSHPilot Host Plugin registration check failed')
+    const mcp = await fetch(`${url}/__dshpilot/mcp`)
+    const mcpValue = await mcp.json() as { records?: Array<{ id?: string; status?: string }>; liveReload?: boolean }
+    if (!mcp.ok || mcpValue.liveReload !== true || !mcpValue.records?.some(record => record.id === 'smoke-disabled' && record.status === 'disabled')) throw new Error('Packaged DSHPilot MCP composition check failed')
     if (remotePort === undefined) throw new Error('Packaged DSHPilot remote control did not announce readiness')
     const remoteHealth = await fetch(`http://127.0.0.1:${String(remotePort)}/health`)
     if (!remoteHealth.ok || (await remoteHealth.json() as { ok?: boolean }).ok !== true) throw new Error('Packaged DSHPilot remote control health check failed')

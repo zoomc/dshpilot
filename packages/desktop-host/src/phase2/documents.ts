@@ -1,6 +1,9 @@
 import { crc32, inflateRawSync, inflateSync } from 'node:zlib'
 import { posix } from 'node:path'
 import { DEFAULT_DOCUMENT_LIMITS, type DocumentAttachmentManifest, type DocumentKind, type DocumentLimits, type DocumentProvider } from './attachments.js'
+import { runParserWorker, type ParserWorkerOptions } from './parser-worker-client.js'
+
+export { ParserWorkerError } from './parser-worker-client.js'
 
 export interface DocumentInspection {
   attachmentId: string
@@ -164,7 +167,14 @@ function pdfText(data: Uint8Array, signal?: AbortSignal, maxExpandedBytes = DEFA
 
 function plainText(data: Uint8Array, kind: DocumentKind): string { const value = text(data); if (kind === 'json') { try { return JSON.stringify(JSON.parse(value), null, 2) } catch { return value } } return kind === 'xml' ? xmlText(value) : value }
 
-export class LocalDocumentTools implements DocumentToolProvider {
+/**
+ * The parser implementation used inside the dedicated parser subprocess.
+ *
+ * Keep this class free of process management: a worker must be able to import
+ * the parser without recursively creating another worker. Callers in the host
+ * should use LocalDocumentTools, which is the isolated facade below.
+ */
+export class InProcessDocumentTools implements DocumentToolProvider {
   constructor(readonly provider: DocumentProvider, readonly maxOutputCharacters = 200_000) {}
   private async bytes(manifest: DocumentAttachmentManifest, signal?: AbortSignal): Promise<Uint8Array> { check(signal); const data = await this.provider.read(manifest.attachmentId, signal); check(signal); return data }
   private parse(manifest: DocumentAttachmentManifest, data: Uint8Array, signal?: AbortSignal): { text: string; pages?: number; rows?: string[][]; sheets?: SpreadsheetSheetInfo[]; slides?: number } {
@@ -176,7 +186,7 @@ export class LocalDocumentTools implements DocumentToolProvider {
     return { text: plainText(data, manifest.kind) }
   }
   async inspect(manifest: DocumentAttachmentManifest, signal?: AbortSignal): Promise<DocumentInspection> { const value = this.parse(manifest, await this.bytes(manifest, signal), signal); return { attachmentId: manifest.attachmentId, name: manifest.name, kind: manifest.kind, bytes: manifest.bytes, textCharacters: value.text?.length ?? 0, ...(value.pages === undefined ? {} : { pages: value.pages }), ...(value.sheets === undefined ? {} : { sheets: value.sheets }), ...(value.slides === undefined ? {} : { slides: value.slides }), manifestOnly: true } }
-  async read(manifest: DocumentAttachmentManifest, options: { offset?: number; limit?: number; sheet?: string; range?: string; slide?: number; signal?: AbortSignal } = {}): Promise<DocumentReadResult> {
+  async read(manifest: DocumentAttachmentManifest, options: { offset?: number; limit?: number; sheet?: string | number; range?: string; slide?: number; signal?: AbortSignal } = {}): Promise<DocumentReadResult> {
     const data = await this.bytes(manifest, options.signal)
     if (manifest.kind === 'xlsx' && (options.sheet !== undefined || options.range !== undefined)) return this.spreadsheetReadRange(manifest, options.sheet ?? 0, options.range ?? 'A1:Z100', options.signal)
     if (manifest.kind === 'pptx' && options.slide !== undefined) return this.presentationSlide(manifest, options.slide, options.signal)
@@ -188,3 +198,50 @@ export class LocalDocumentTools implements DocumentToolProvider {
   async spreadsheetReadRange(manifest: DocumentAttachmentManifest, sheet: string | number, range: string, signal?: AbortSignal): Promise<DocumentReadResult> { if (manifest.kind !== 'xlsx' && manifest.kind !== 'csv') throw new Error('spreadsheet_read_range requires XLSX or CSV'); const data = await this.bytes(manifest, signal); const parsed = manifest.kind === 'xlsx' ? spreadsheet(data, signal, manifest.limits ?? DEFAULT_DOCUMENT_LIMITS) : { rows: new Map([['CSV', csvRows(text(data), 20_000, signal)]]), sheets: [{ name: 'CSV', index: 0, rows: 0, columns: 0 }] }; const name = typeof sheet === 'number' ? parsed.sheets[sheet]?.name : sheet; if (!name || !parsed.rows.has(name)) throw new Error(`unknown spreadsheet sheet: ${String(sheet)}`); const table = parsed.rows.get(name)!; const bounds = parseRange(range); const rows = table.slice(bounds.from.row, bounds.to.row + 1).map(row => row.slice(bounds.from.column, bounds.to.column + 1)); return { attachmentId: manifest.attachmentId, kind: manifest.kind, rows, text: rows.map(row => row.join('\t')).join('\n'), truncated: false, manifestOnly: false } }
   async presentationSlide(manifest: DocumentAttachmentManifest, slide: number, signal?: AbortSignal): Promise<DocumentReadResult> { if (manifest.kind !== 'pptx') throw new Error('presentation_slide requires a PPTX attachment'); if (!Number.isInteger(slide) || slide < 0) throw new Error('slide index must be a non-negative integer'); const data = await this.bytes(manifest, signal); const limits = manifest.limits ?? DEFAULT_DOCUMENT_LIMITS; const entries = zipEntries(data, limits.maxArchiveEntries, limits.maxExpandedBytes, limits.maxCompressionRatio, signal); const path = `ppt/slides/slide${slide + 1}.xml`; const entry = entries.get(path); if (!entry) throw new Error(`slide does not exist: ${slide}`); const value = limited(xmlText(text(zipRead(data, entry))), this.maxOutputCharacters); return { attachmentId: manifest.attachmentId, kind: manifest.kind, slide: { index: slide, text: value.value }, text: value.value, truncated: value.truncated, manifestOnly: false } }
 }
+
+/**
+ * Process-isolated document tools. Every operation gets a short-lived child
+ * process and a private 0700/0600 input directory. This is deliberately a
+ * one-request-per-process protocol: killing a stuck synchronous parser cannot
+ * leave a poisoned parser worker behind for the next request.
+ */
+export class IsolatedDocumentTools implements DocumentToolProvider {
+  private readonly runner: typeof runParserWorker
+
+  constructor(
+    readonly provider: DocumentProvider,
+    readonly maxOutputCharacters = 200_000,
+    readonly workerOptions: ParserWorkerOptions = {},
+  ) {
+    this.runner = runParserWorker
+  }
+
+  inspect(manifest: DocumentAttachmentManifest, signal?: AbortSignal): Promise<DocumentInspection> {
+    return this.runner(this.provider, manifest, { operation: 'inspect', maxOutputCharacters: this.maxOutputCharacters }, this.workerOptions, signal)
+  }
+
+  read(manifest: DocumentAttachmentManifest, options: { offset?: number; limit?: number; sheet?: string | number; range?: string; slide?: number; signal?: AbortSignal } = {}): Promise<DocumentReadResult> {
+    const { signal, ...readOptions } = options
+    return this.runner(this.provider, manifest, { operation: 'read', options: readOptions, maxOutputCharacters: this.maxOutputCharacters }, this.workerOptions, signal)
+  }
+
+  search(manifest: DocumentAttachmentManifest, query: string, options: { maxMatches?: number; signal?: AbortSignal } = {}): Promise<DocumentSearchResult> {
+    const { signal, ...searchOptions } = options
+    return this.runner(this.provider, manifest, { operation: 'search', query, options: searchOptions, maxOutputCharacters: this.maxOutputCharacters }, this.workerOptions, signal)
+  }
+
+  spreadsheetSheetInfo(manifest: DocumentAttachmentManifest, signal?: AbortSignal): Promise<SpreadsheetSheetInfo[]> {
+    return this.runner(this.provider, manifest, { operation: 'spreadsheetSheetInfo', maxOutputCharacters: this.maxOutputCharacters }, this.workerOptions, signal)
+  }
+
+  spreadsheetReadRange(manifest: DocumentAttachmentManifest, sheet: string | number, range: string, signal?: AbortSignal): Promise<DocumentReadResult> {
+    return this.runner(this.provider, manifest, { operation: 'spreadsheetReadRange', sheet, range, maxOutputCharacters: this.maxOutputCharacters }, this.workerOptions, signal)
+  }
+
+  presentationSlide(manifest: DocumentAttachmentManifest, slide: number, signal?: AbortSignal): Promise<DocumentReadResult> {
+    return this.runner(this.provider, manifest, { operation: 'presentationSlide', slide, maxOutputCharacters: this.maxOutputCharacters }, this.workerOptions, signal)
+  }
+}
+
+/** Backwards-compatible host facade; existing plugin callers are isolated. */
+export class LocalDocumentTools extends IsolatedDocumentTools {}

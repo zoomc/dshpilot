@@ -75,6 +75,8 @@ export interface DeviceInfo {
   deviceId: string
   name: string
   scopes: readonly ControlScope[]
+  /** Ed25519 public key registered during pairing. Legacy devices may omit it. */
+  identityPublicKey?: string
   createdAt: string
   lastSeenAt?: string
   revokedAt?: string
@@ -91,6 +93,17 @@ export interface PairingOffer {
   nonce: string
   expiresAt: string
   relayEndpoint?: string
+}
+
+export interface DevicePairingRequest {
+  code: string
+  name: string
+  scopes?: readonly ControlScope[]
+  offerId?: string
+  serverId?: string
+  serverPublicKey?: string
+  identityPublicKey?: string
+  pairingProof?: string
 }
 
 export interface ControlEvent<TPayload = Record<string, unknown>> {
@@ -118,6 +131,7 @@ export interface PromptAdmissionRequest {
   input: string
   mode?: 'queue' | 'steer'
   cwd?: string
+  workspaceId?: string
   clientId?: string
 }
 
@@ -128,10 +142,10 @@ export type ControlRequest =
   | { kind: 'task_list' }
   | { kind: 'events'; after?: number; limit?: number }
   | PromptAdmissionRequest
-  | { kind: 'interrupt'; requestId: string; sessionId: string }
-  | { kind: 'permission_list'; sessionId?: string }
+  | { kind: 'interrupt'; requestId: string; sessionId: string; workspaceId?: string }
+  | { kind: 'permission_list'; sessionId?: string; workspaceId?: string }
   | { kind: 'permission_reply'; requestId: string; permissionId: string; decision: 'allow' | 'deny' }
-  | { kind: 'question_reply'; requestId: string; rpcId: string; sessionId: string; answers: Array<{ id: string; selected: string[]; custom?: string }> }
+  | { kind: 'question_reply'; requestId: string; rpcId: string; sessionId: string; workspaceId?: string; answers: Array<{ id: string; selected: string[]; custom?: string }> }
   | { kind: 'device_list' }
   | { kind: 'device_revoke'; deviceId: string }
   | { kind: 'device_rotate'; deviceId: string }
@@ -166,11 +180,13 @@ export function assertControlRequest(value: unknown): asserts value is ControlRe
     if (request.mode !== undefined && request.mode !== 'queue' && request.mode !== 'steer') throw new Error('prompt mode is invalid')
     if (request.sessionId !== undefined && (typeof request.sessionId !== 'string' || !ID.test(request.sessionId))) throw new Error('sessionId is invalid')
     if (request.cwd !== undefined && (typeof request.cwd !== 'string' || request.cwd.length > 4_096)) throw new Error('cwd is invalid')
+    if (request.workspaceId !== undefined && (typeof request.workspaceId !== 'string' || !ID.test(request.workspaceId))) throw new Error('workspaceId is invalid')
     if (request.clientId !== undefined && (typeof request.clientId !== 'string' || !ID.test(request.clientId))) throw new Error('clientId is invalid')
     return
   }
   if (request.kind === 'interrupt' || request.kind === 'permission_reply' || request.kind === 'question_reply') assertRequestId(request.requestId)
   if (request.kind === 'interrupt' && (typeof request.sessionId !== 'string' || !ID.test(request.sessionId))) throw new Error('sessionId is invalid')
+  if ((request.kind === 'interrupt' || request.kind === 'permission_list' || request.kind === 'question_reply') && request.workspaceId !== undefined && (typeof request.workspaceId !== 'string' || !ID.test(request.workspaceId))) throw new Error('workspaceId is invalid')
   if (request.kind === 'permission_list' && request.sessionId !== undefined && (typeof request.sessionId !== 'string' || !ID.test(request.sessionId))) throw new Error('sessionId is invalid')
   if (request.kind === 'permission_reply') {
     if (typeof request.permissionId !== 'string' || !ID.test(request.permissionId)) throw new Error('permissionId is invalid')

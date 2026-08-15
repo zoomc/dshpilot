@@ -71,6 +71,25 @@ describe('control plane', () => {
     await server.stop()
   })
 
+  it('applies resource authorization to projected reads and receives the control request', async () => {
+    const operations: string[] = []
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-resource-auth-'))
+    const server = new ControlPlaneServer({
+      version: '0.1.0', devicesPath: join(root, 'devices.json'), remoteEnabled: true, allowLocalPairingOffer: true,
+      authorization: context => { operations.push(context.operation); if (context.operation === 'artifact_read') return false; return true },
+      adapter: { tasks: async () => [], artifacts: async () => [], artifactRead: async () => new Uint8Array([1]) },
+    })
+    const address = await server.start(); const base = `http://${address.host}:${address.port}`; const offer = server.devices.createOffer()
+    const paired = (await (await fetch(`${base}/v1/pair`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: offer.code, name: 'resource auth' }) })).json() as { value: { token: string } }).value
+    const headers = { authorization: `Bearer ${paired.token}` }
+    expect((await fetch(`${base}/v1/tasks`, { headers })).status).toBe(200)
+    expect((await fetch(`${base}/v1/artifacts/sha256:${'0'.repeat(64)}`, { headers })).status).toBe(401)
+    const control = await fetch(`${base}/v1/control`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'session_list' }) })
+    expect(control.status).toBe(200)
+    expect(operations).toEqual(expect.arrayContaining(['task_list', 'artifact_read', 'session_list']))
+    await server.stop()
+  })
+
   it('exposes an authenticated opaque relay WebSocket', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dshpilot-relay-'))
     const server = new ControlPlaneServer({ version: '0.1.0', devicesPath: join(root, 'devices.json'), remoteEnabled: true, relayEnabled: true })
@@ -81,7 +100,7 @@ describe('control plane', () => {
     const session = createRelaySession(); const identity = createRelayIdentity(); const socket = new WebSocket(`ws://${address.host}:${address.port}/v1/relay`, { headers: { authorization: `Bearer ${token}` } })
     const ready = new Promise<void>((resolveReady, rejectReady) => { socket.once('error', rejectReady); socket.on('message', data => { if (JSON.parse(data.toString()).type === 'ready') resolveReady() }) })
     await new Promise<void>((resolveOpen, rejectOpen) => { socket.once('open', () => resolveOpen()); socket.once('error', rejectOpen) })
-    socket.send(JSON.stringify({ type: 'handshake', handshake: signRelayHandshake(identity, session.sessionId, session.keyPair.publicKey) }))
+    socket.send(JSON.stringify({ type: 'handshake', handshake: signRelayHandshake(identity, { sessionId: session.sessionId, x25519PublicKey: session.keyPair.publicKey, deviceId: 'legacy-device', serverId: server.devices.serverId(), serverPublicKey: server.devices.publicKey(), role: 'client' }) }))
     await ready
     socket.close(); await new Promise<void>(resolveClose => socket.once('close', () => resolveClose()))
     await server.stop()
@@ -94,7 +113,7 @@ describe('control plane', () => {
     const token = (await pairResponse.json() as { value: { token: string } }).value.token
     const session = createRelaySession(); const identity = createRelayIdentity(); const socket = new WebSocket(`ws://${address.host}:${address.port}/v1/relay`, { headers: { authorization: `Bearer ${token}` } })
     await new Promise<void>((resolveOpen, rejectOpen) => { socket.once('open', () => resolveOpen()); socket.once('error', rejectOpen) })
-    socket.send(JSON.stringify({ type: 'handshake', handshake: signRelayHandshake(identity, session.sessionId, session.keyPair.publicKey) }))
+    socket.send(JSON.stringify({ type: 'handshake', handshake: signRelayHandshake(identity, { sessionId: session.sessionId, x25519PublicKey: session.keyPair.publicKey, deviceId: 'legacy-device', serverId: server.devices.serverId(), serverPublicKey: server.devices.publicKey(), role: 'client' }) }))
     await new Promise<void>((resolveReady, rejectReady) => { socket.once('message', data => JSON.parse(data.toString()).type === 'ready' ? resolveReady() : undefined); socket.once('error', rejectReady) })
     socket.send(JSON.stringify({ sessionId: session.sessionId, direction: 'client_to_server', frameSeq: 1, plaintext: 'must not be relayed' }))
     await new Promise<void>((resolveClose, rejectClose) => { socket.once('close', () => resolveClose()); socket.once('error', rejectClose) })
@@ -118,6 +137,14 @@ describe('relay payloads', () => {
     expect(new TextDecoder().decode(decryptRelayFrame(right.privateKey, left.publicKey, frame, guard))).toBe('one')
     expect(() => decryptRelayFrame(right.privateKey, left.publicKey, frame, guard)).toThrow('replay')
     expect(() => decryptRelayFrame(right.privateKey, left.publicKey, { ...frame, frameSeq: 2, direction: 'server_to_client' }, new RelayReplayGuard())).toThrow()
+  })
+
+  it('does not consume a replay sequence when ciphertext authentication fails', () => {
+    const left = createRelayKeyPair(); const right = createRelayKeyPair(); const guard = new RelayReplayGuard()
+    const frame = encryptRelayFrame(left.privateKey, right.publicKey, 'sequence-safety', 'client_to_server', 1, new TextEncoder().encode('payload'))
+    const corrupted = Buffer.from(frame.ciphertext, 'base64'); corrupted[0] = (corrupted[0] ?? 0) ^ 1
+    expect(() => decryptRelayFrame(right.privateKey, left.publicKey, { ...frame, ciphertext: corrupted.toString('base64') }, guard)).toThrow()
+    expect(new TextDecoder().decode(decryptRelayFrame(right.privateKey, left.publicKey, frame, guard))).toBe('payload')
   })
 
   it('binds an ephemeral key to an authenticated identity and routes opaque frames only', () => {

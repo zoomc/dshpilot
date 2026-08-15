@@ -5,7 +5,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path'
 import { realpath } from 'node:fs/promises'
 import {
   LocalDocumentProvider, LocalDocumentTools, McpManager, inspectTokenUsage, parseMcpImport, validateMcpServer,
-  createDesktopNotification, shouldNotify, officialMcpPluginConfig,
+  createDesktopNotification, shouldNotify, officialMcpPluginConfig, resolveOfficialMcpPluginConfig,
   ArtifactStore, GitPresentation, SessionLineageStore,
   type ResourceReference,
   DocumentProviderRegistry, type DocumentAttachmentManifest, type McpImportPreview, type McpServerRecord, type SessionLineage, validateDocumentManifest,
@@ -16,7 +16,7 @@ import type { PermissionSummary, RuntimeStatus, SessionSummary, TaskSummary } fr
 export const pluginName = '@dshpilot/dsh-plugin-desktop'
 
 export const name = 'dshpilot-desktop'
-export const inject: readonly string[] = ['webServer', 'apiProxy', 'tools', 'loader']
+export const inject: readonly string[] = ['webServer', 'apiProxy', 'tools', 'loader', 'credentials']
 
 interface HarnessApi {
   sessions: {
@@ -73,6 +73,8 @@ export interface DesktopHostPluginContext {
   apiProxy?: HarnessApi
   /** Official @deepseek-ai/dsh-tools registry. The plugin only uses its public register seam. */
   tools?: { register(definition: unknown): () => void; schemas?: () => readonly unknown[] }
+  /** Official @deepseek-ai/dsh-credentials service; values are resolved per loader reconcile and never persisted. */
+  credentials?: { resolve(ref: string): Promise<{ value: string; source?: string } | undefined> }
   loader?: {
     entries(): Iterable<{ id: string; options: { name: string; config?: unknown; disabled?: boolean }; fiber?: { state?: number } }>
     create(options: { name: string; config?: unknown; disabled?: boolean }): Promise<string>
@@ -124,7 +126,7 @@ function registerDocumentTools(ctx: DesktopHostPluginContext): () => void {
   const provider = localDocumentProvider(); const toolsFor = (manifest: DocumentAttachmentManifest): LocalDocumentTools => new LocalDocumentTools(providerForManifest(manifest))
   const definitions = [
     documentToolDefinition('document_inspect', 'Inspect a document attachment without returning its body.', { attachmentId: { type: 'string', required: true } }, async (args, exec) => { const manifest = await documentManifest(args.attachmentId); return toolsFor(manifest).inspect(manifest, exec.signal) }),
-    documentToolDefinition('document_read', 'Read bounded document text or a spreadsheet range on demand.', { attachmentId: { type: 'string', required: true }, offset: { type: 'integer' }, limit: { type: 'integer' }, sheet: { oneOf: [{ type: 'string' }, { type: 'integer' }] }, range: { type: 'string' }, slide: { type: 'integer' } }, async (args, exec) => { const manifest = await documentManifest(args.attachmentId); return toolsFor(manifest).read(manifest, { offset: args.offset, limit: args.limit, sheet: args.sheet === undefined ? undefined : String(args.sheet), range: args.range, slide: args.slide, signal: exec.signal }) }),
+    documentToolDefinition('document_read', 'Read bounded document text or a spreadsheet range on demand.', { attachmentId: { type: 'string', required: true }, offset: { type: 'integer' }, limit: { type: 'integer' }, sheet: { oneOf: [{ type: 'string' }, { type: 'integer' }] }, range: { type: 'string' }, slide: { type: 'integer' } }, async (args, exec) => { const manifest = await documentManifest(args.attachmentId); return toolsFor(manifest).read(manifest, { offset: args.offset, limit: args.limit, sheet: args.sheet, range: args.range, slide: args.slide, signal: exec.signal }) }),
     documentToolDefinition('document_search', 'Search a bounded document projection and return matching lines.', { attachmentId: { type: 'string', required: true }, query: { type: 'string', required: true }, maxMatches: { type: 'integer' } }, async (args, exec) => { const manifest = await documentManifest(args.attachmentId); return toolsFor(manifest).search(manifest, args.query ?? '', { maxMatches: args.maxMatches, signal: exec.signal }) }),
     documentToolDefinition('spreadsheet_sheet_info', 'List sheet names and bounded dimensions for an XLSX attachment.', { attachmentId: { type: 'string', required: true } }, async (args, exec) => { const manifest = await documentManifest(args.attachmentId); return { sheets: await toolsFor(manifest).spreadsheetSheetInfo(manifest, exec.signal) } }),
     documentToolDefinition('spreadsheet_read_range', 'Read a bounded cell range from an XLSX or CSV attachment.', { attachmentId: { type: 'string', required: true }, sheet: { oneOf: [{ type: 'string' }, { type: 'integer' }] }, range: { type: 'string', required: true } }, async (args, exec) => { const manifest = await documentManifest(args.attachmentId); return toolsFor(manifest).spreadsheetReadRange(manifest, args.sheet ?? 0, args.range ?? 'A1:Z100', exec.signal) }),
@@ -140,11 +142,12 @@ const dshpilotRoot = (): string => join(dshHome(), 'dshpilot')
 const requestId = (): string => `dshpilot-${randomUUID()}`
 const managedMcpEntryIds = new Set<string>()
 
-function liveMcpConfig(record: McpServerRecord): ReturnType<typeof officialMcpPluginConfig> {
-  const config = officialMcpPluginConfig(record)
-  for (const [key, environment] of Object.entries(record.envRefs)) if (process.env[environment] !== undefined) config.env[key] = process.env[environment] as string
-  for (const [key, environment] of Object.entries(record.headerRefs)) if (process.env[environment] !== undefined) config.headers[key] = process.env[environment] as string
-  return config
+async function liveMcpConfig(ctx: DesktopHostPluginContext, record: McpServerRecord): Promise<ReturnType<typeof officialMcpPluginConfig>> {
+  if (Object.keys(record.envRefs).length > 0 || Object.keys(record.headerRefs).length > 0) {
+    if (ctx.credentials === undefined) throw new Error(`${record.id}: official credentials service is required for credential references`)
+    return resolveOfficialMcpPluginConfig(record, ctx.credentials)
+  }
+  return officialMcpPluginConfig(record)
 }
 
 async function boundedResponseBytes(response: Response, maximum = 100 * 1024 * 1024): Promise<Uint8Array> {
@@ -184,7 +187,7 @@ async function listDocuments(): Promise<DocumentAttachmentManifest[]> {
   } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error }
 }
 
-async function reconcileMcpLoader(ctx: DesktopHostPluginContext, records: readonly McpServerRecord[]): Promise<{ reloaded: boolean; managedEntries: number }> {
+export async function reconcileMcpLoader(ctx: DesktopHostPluginContext, records: readonly McpServerRecord[]): Promise<{ reloaded: boolean; managedEntries: number }> {
   const loader = ctx.loader
   if (loader === undefined) return { reloaded: false, managedEntries: 0 }
   const desired = new Map(records.map(record => [record.serverName, record]))
@@ -196,31 +199,53 @@ async function reconcileMcpLoader(ctx: DesktopHostPluginContext, records: readon
     const serverName = typeof config.serverName === 'string' ? config.serverName : undefined
     const record = serverName === undefined ? undefined : desired.get(serverName)
     if (record === undefined) { if (managedMcpEntryIds.has(entry.id)) { await loader.remove(entry.id); managedMcpEntryIds.delete(entry.id); changed = true } continue }
+    if (seen.has(record.serverName)) {
+      // A duplicate namespace cannot be a valid official MCP composition. Only
+      // remove duplicates DSHPilot created in this process; user-owned entries
+      // remain untouched and are surfaced by the official Loader diagnostics.
+      if (managedMcpEntryIds.has(entry.id)) { await loader.remove(entry.id); managedMcpEntryIds.delete(entry.id); changed = true }
+      continue
+    }
     seen.add(record.serverName)
     managedMcpEntryIds.add(entry.id)
-    await loader.update(entry.id, { disabled: !record.enabled, config: liveMcpConfig(record) })
-    changed = true
+    const nextConfig = await liveMcpConfig(ctx, record)
+    const sameConfig = JSON.stringify(entry.options.config) === JSON.stringify(nextConfig)
+    const sameDisabled = entry.options.disabled === !record.enabled
+    if (!sameConfig || !sameDisabled) {
+      await loader.update(entry.id, { disabled: !record.enabled, config: nextConfig })
+      changed = true
+    }
   }
   for (const record of records) {
     if (seen.has(record.serverName)) continue
-    const entryId = await loader.create({ name: '@deepseek-ai/dsh-mcp-client', disabled: !record.enabled, config: liveMcpConfig(record) })
+    const entryId = await loader.create({ name: '@deepseek-ai/dsh-mcp-client', disabled: !record.enabled, config: await liveMcpConfig(ctx, record) })
     managedMcpEntryIds.add(entryId)
     changed = true
   }
   return { reloaded: changed, managedEntries: records.length }
 }
 
-function liveMcpRecords(ctx: DesktopHostPluginContext, records: readonly McpServerRecord[]): McpServerRecord[] {
+export function liveMcpRecords(ctx: DesktopHostPluginContext, records: readonly McpServerRecord[]): McpServerRecord[] {
   if (ctx.loader === undefined) return [...records]
   const entries = [...ctx.loader.entries()].filter(entry => entry.options.name === '@deepseek-ai/dsh-mcp-client')
   const schemas = ctx.tools?.schemas?.() ?? []
   const schemaNames = schemas.flatMap(item => typeof item === 'object' && item !== null && typeof (item as { name?: unknown }).name === 'string' ? [(item as { name: string }).name] : [])
   return records.map(record => {
     const config = entries.find(entry => typeof entry.options.config === 'object' && entry.options.config !== null && (entry.options.config as { serverName?: unknown }).serverName === record.serverName)
-    if (config === undefined) return record
-    const status: McpServerRecord['status'] = config.options.disabled === true ? 'disabled' : config.fiber?.state === 3 ? 'failed' : config.fiber?.state === 2 ? 'ready' : 'connecting'
+    if (config === undefined) return { ...record, status: record.enabled ? 'configured' : 'disabled', statusSource: 'persisted', toolCount: undefined, toolCountSource: undefined }
+    // Cordis FiberState is the official Loader lifecycle source:
+    // PENDING=0, LOADING=1, ACTIVE=2, FAILED=3, DISPOSED=4, UNLOADING=5.
+    const status: McpServerRecord['status'] = config.options.disabled === true
+      ? 'disabled'
+      : config.fiber?.state === 3
+        ? 'failed'
+        : config.fiber?.state === 2
+          ? 'ready'
+          : config.fiber?.state === 4 || config.fiber?.state === 5
+            ? 'reconnecting'
+            : 'connecting'
     const toolCount = schemaNames.filter(name => name.startsWith(`mcp__${record.serverName}__`)).length
-    return { ...record, status, ...(toolCount === 0 ? {} : { toolCount }) }
+    return { ...record, status, statusSource: 'loader-fiber', toolCount, toolCountSource: 'tools-registry' }
   })
 }
 
@@ -253,7 +278,7 @@ async function documentRoute(request: IncomingMessage, response: ServerResponse)
   if (manifest === undefined) { json(response, 404, { error: 'document attachment was not found' }); return }
   const tools = new LocalDocumentTools(providerForManifest(manifest))
   if (value.action === 'inspect') { json(response, 200, await tools.inspect(manifest)); return }
-  if (value.action === 'read') { json(response, 200, await tools.read(manifest, { offset: typeof value.offset === 'number' ? value.offset : undefined, limit: typeof value.limit === 'number' ? value.limit : undefined, sheet: typeof value.sheet === 'string' ? value.sheet : undefined, range: typeof value.range === 'string' ? value.range : undefined, slide: typeof value.slide === 'number' ? value.slide : undefined })); return }
+  if (value.action === 'read') { json(response, 200, await tools.read(manifest, { offset: typeof value.offset === 'number' ? value.offset : undefined, limit: typeof value.limit === 'number' ? value.limit : undefined, sheet: typeof value.sheet === 'string' || typeof value.sheet === 'number' ? value.sheet : undefined, range: typeof value.range === 'string' ? value.range : undefined, slide: typeof value.slide === 'number' ? value.slide : undefined })); return }
   if (value.action === 'search' && typeof value.query === 'string') { json(response, 200, await tools.search(manifest, value.query, { maxMatches: typeof value.maxMatches === 'number' ? value.maxMatches : undefined })); return }
   if (value.action === 'spreadsheet_sheet_info') { json(response, 200, { sheets: await tools.spreadsheetSheetInfo(manifest) }); return }
   if (value.action === 'spreadsheet_read_range' && typeof value.range === 'string') { json(response, 200, await tools.spreadsheetReadRange(manifest, typeof value.sheet === 'number' || typeof value.sheet === 'string' ? value.sheet : 0, value.range)); return }
@@ -268,17 +293,16 @@ async function tokenRoute(request: IncomingMessage, response: ServerResponse, ct
   if (official === undefined && sessionId !== null && ctx.apiProxy?.sessions.history !== undefined) {
     try {
       const history = officialValue(await ctx.apiProxy.sessions.history({ rpcId: requestId(), payload: { sessionId, maxMessages: 200 } }))
-      let inputTokens = 0; let outputTokens = 0; let cacheReadTokens = 0; let cacheWriteTokens = 0; let reasoningTokens = 0; let contextWindow: number | undefined
-      let hasUsage = false
+      let latestUsage: Record<string, number | undefined> | undefined; let contextWindow: number | undefined
       for (const entry of history.events) {
         const event = entry.event; const data = typeof event.data === 'object' && event.data !== null ? event.data as Record<string, unknown> : {}
         if (event.type === 'assistant/message' && typeof data.usage === 'object' && data.usage !== null) {
-          const usage = data.usage as Record<string, unknown>; const number = (key: string): number => typeof usage[key] === 'number' && Number.isFinite(usage[key]) && usage[key] >= 0 ? Math.floor(usage[key] as number) : 0
-          inputTokens += number('inputTokens'); outputTokens += number('outputTokens'); cacheReadTokens += number('cacheReadTokens'); cacheWriteTokens += number('cacheWriteTokens'); reasoningTokens += number('reasoningTokens'); hasUsage = true
+          const usage = data.usage as Record<string, unknown>; const number = (key: string): number | undefined => typeof usage[key] === 'number' && Number.isFinite(usage[key]) && usage[key] >= 0 ? Math.floor(usage[key] as number) : undefined
+          latestUsage = Object.fromEntries(Object.entries({ inputTokens: number('inputTokens'), outputTokens: number('outputTokens'), cacheReadTokens: number('cacheReadTokens'), cacheWriteTokens: number('cacheWriteTokens'), reasoningTokens: number('reasoningTokens') }).filter(([, value]) => value !== undefined))
         }
         if (event.type === 'request/context' && typeof data.contextWindow === 'number' && Number.isFinite(data.contextWindow)) contextWindow = Math.floor(data.contextWindow)
       }
-      if (hasUsage || contextWindow !== undefined) official = { usage: { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens }, contextWindow }
+      if (latestUsage !== undefined || contextWindow !== undefined) official = { usage: latestUsage ?? {}, contextWindow }
     } catch { /* the estimate below is explicit when a history page is unavailable */ }
   }
   json(response, 200, { usage: inspectTokenUsage(official, { messages: [], toolSchemas: ctx.tools?.schemas?.() ?? [], attachmentManifests: [] }), note: official === undefined ? 'Official usage is not exposed by this Harness build; this value is an estimate.' : undefined })
@@ -445,13 +469,19 @@ function createRemoteAdapter(api: HarnessApi): {
     }).catch(() => undefined)
   }
   const hydrate = async (): Promise<void> => {
+    let discardedInteractiveState = false
     try {
       const value = JSON.parse(await readFile(projectionPath, 'utf8')) as Partial<RemoteProjection>
       if (value.schemaVersion !== 1) return
       if (Array.isArray(value.jobs)) for (const job of value.jobs) if (typeof job?.id === 'string' && typeof job.kind === 'string' && typeof job.label === 'string' && typeof job.startedAt === 'number') jobs.set(job.id, job)
-      if (Array.isArray(value.permissions)) for (const permission of value.permissions) if (permission?.summary?.permissionId !== undefined && permission.summary.status === 'pending') permissions.set(permission.summary.permissionId, permission)
-      if (Array.isArray(value.questions)) for (const question of value.questions) if (typeof question?.rpcId === 'string' && typeof question.sessionId === 'string') questions.set(question.rpcId, question)
+      // Harness RPC ids are process-local. Persisting an approval/question as
+      // actionable after a Harness restart would make the remote UI send a
+      // stale response to a new process. Drop only interactive waiters and
+      // rewrite the projection; durable jobs and lineage remain available.
+      if (value.permissions?.some(permission => permission?.summary?.status === 'pending')) discardedInteractiveState = true
+      if (value.questions?.some(question => typeof question?.rpcId === 'string')) discardedInteractiveState = true
       if (Array.isArray(value.lineage)) for (const record of value.lineage) if (typeof record?.sessionId === 'string' && typeof record?.rootSessionId === 'string' && typeof record?.createdAt === 'string') lineage.add(record)
+      if (discardedInteractiveState) persistProjection()
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') console.error(`DSHPilot remote projection ignored: ${String(error)}`) }
   }
   const adapter = {
@@ -586,7 +616,7 @@ function startRemoteControl(ctx: DesktopHostPluginContext): void {
     await makeDir(dshpilotRoot(), { recursive: true, mode: 0o700 })
     const tls = tlsKeyPath !== undefined && tlsCertPath !== undefined ? { key: await read(resolve(tlsKeyPath)), cert: await read(resolve(tlsCertPath)) } : undefined
     await bridge.hydrate()
-    server = new ControlPlaneServer({ name: 'DSHPilot self-hosted Harness control plane', version: '0.1.0', host, port, remoteEnabled: true, tls, corsOrigins, eventsPath, devicesPath, relayEnabled: true, allowLocalPairingOffer: process.env.DSHPILOT_REMOTE_ALLOW_LOCAL_PAIRING === '1', allowLocalAdminPairing: process.env.DSHPILOT_REMOTE_ALLOW_LOCAL_ADMIN === '1', adapter: bridge.adapter })
+    server = new ControlPlaneServer({ name: 'DSHPilot self-hosted Harness control plane', version: '0.1.0', host, port, remoteEnabled: true, tls, corsOrigins, eventsPath, devicesPath, relayEnabled: true, allowLocalPairingOffer: process.env.DSHPILOT_REMOTE_ALLOW_LOCAL_PAIRING === '1', allowLocalAdminPairing: process.env.DSHPILOT_REMOTE_ALLOW_LOCAL_ADMIN === '1', authorization: async context => { if (context.cwd !== undefined && context.cwd !== '') await validateRemoteCwd(context.cwd); return true }, adapter: bridge.adapter })
     const address = await server.start()
     if (disposed) { await server.stop(); return }
     started = true
@@ -607,7 +637,7 @@ function startRemoteControl(ctx: DesktopHostPluginContext): void {
  * intentionally a small Cordis seam that can be loaded by a Harness profile
  * without introducing a second session or MCP implementation.
  */
-export function apply(ctx: DesktopHostPluginContext): void {
+export async function apply(ctx: DesktopHostPluginContext): Promise<void> {
   const disposers = [ctx.webServer?.register({
     kind: 'exact', path: '/__dshpilot/health',
     handler: async (_request, response) => {
@@ -639,7 +669,8 @@ export function apply(ctx: DesktopHostPluginContext): void {
   const disposeDocumentTools = registerDocumentTools(ctx)
   ctx.effect?.(() => disposeDocumentTools, 'dshpilot.document-tools')
   if (ctx.loader !== undefined) {
-    void new McpManager(dshHome()).list().then(records => reconcileMcpLoader(ctx, records)).catch(error => console.error(`DSHPilot MCP startup reconcile failed: ${String(error)}`))
+    const records = await new McpManager(dshHome()).list()
+    await reconcileMcpLoader(ctx, records)
   }
   startRemoteControl(ctx)
 }

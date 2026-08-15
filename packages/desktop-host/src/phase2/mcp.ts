@@ -22,6 +22,10 @@ export interface McpServerRecord {
   headers: Record<string, string>
   headerRefs: Record<string, string>
   toolCount?: number
+  /** Runtime state is observed from the official Loader fiber, never inferred from persisted config. */
+  statusSource?: 'loader-fiber' | 'persisted'
+  /** Tool count is observed from the official ToolRuntime registry. */
+  toolCountSource?: 'tools-registry' | 'persisted'
   lastError?: string
   toolCallTimeoutMs?: number
   failOnStartupError?: boolean
@@ -42,6 +46,32 @@ export interface OfficialMcpPluginConfig {
   toolCallTimeoutMs?: number
   failOnStartupError?: boolean
   reconnect?: McpReconnectPolicy
+}
+
+/** The official Harness credential-reference service resolved at operation time. */
+export interface McpCredentialResolver {
+  resolve(ref: string): Promise<{ value: string; source?: string } | undefined>
+}
+
+/**
+ * Resolve credential references only for the in-memory official MCP config.
+ * `McpServerRecord` and the generated patch retain references, never values.
+ */
+export async function resolveOfficialMcpPluginConfig(
+  record: McpServerRecord,
+  credentials: McpCredentialResolver,
+): Promise<OfficialMcpPluginConfig> {
+  const config = officialMcpPluginConfig(record)
+  const resolve = async (kind: 'env' | 'header', key: string, ref: string): Promise<string> => {
+    const resolved = await credentials.resolve(ref)
+    if (resolved === undefined || resolved.value.length === 0) {
+      throw new Error(`${record.id}: ${kind} credential reference "${ref}" is not configured`)
+    }
+    return resolved.value
+  }
+  for (const [key, ref] of Object.entries(record.envRefs)) config.env[key] = await resolve('env', key, ref)
+  for (const [key, ref] of Object.entries(record.headerRefs)) config.headers[key] = await resolve('header', key, ref)
+  return config
 }
 
 export interface McpDiff {
@@ -201,6 +231,8 @@ export interface McpRuntimeStatus {
   status: Exclude<McpRecordStatus, 'configured'>
   toolCount?: number
   lastError?: string
+  statusSource?: 'loader-fiber' | 'persisted'
+  toolCountSource?: 'tools-registry' | 'persisted'
 }
 
 export function parseMcpImport(text: string, source = 'import.json', existing: readonly McpServerRecord[] = []): McpImportPreview {
@@ -323,6 +355,8 @@ export class McpManager {
     record.status = update.status
     record.toolCount = update.toolCount
     record.lastError = update.lastError
+    record.statusSource = update.statusSource
+    record.toolCountSource = update.toolCountSource
     record.updatedAt = new Date().toISOString()
     await this.save(records)
     return records

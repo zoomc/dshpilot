@@ -3,11 +3,15 @@ import type { ControlEvent, ControlResponse, DeviceInfo, EventPage, PairingOffer
 export interface RemoteClientOptions { baseUrl: string; token?: string; refreshToken?: string; deviceId?: string; fetchImpl?: typeof fetch }
 export interface EventStreamOptions { after?: number; generation?: string; signal?: AbortSignal; onEvent: (event: ControlEvent) => void }
 
+interface PairingIdentity { privateKey: CryptoKey; publicKey: string }
+function base64(value: ArrayBuffer): string { let output = ''; for (const byte of new Uint8Array(value)) output += String.fromCharCode(byte); return btoa(output) }
+
 export class RemoteControlClient {
   private readonly baseUrl: string
   private token?: string
   private refreshTokenValue?: string
   private deviceId?: string
+  private pairingIdentity?: PairingIdentity
   private readonly fetchImpl: typeof fetch
   constructor(options: RemoteClientOptions) { this.baseUrl = options.baseUrl.replace(/\/$/u, ''); this.token = options.token; this.refreshTokenValue = options.refreshToken; this.deviceId = options.deviceId; this.fetchImpl = options.fetchImpl ?? fetch }
   async serverInfo(): Promise<ServerInfo> { return this.get<ServerInfo>('/v1/server') }
@@ -27,7 +31,20 @@ export class RemoteControlClient {
   async interrupt(sessionId: string): Promise<ControlResponse> { return this.control({ kind: 'interrupt', requestId: crypto.randomUUID(), sessionId }) }
   async permissionReply(permissionId: string, decision: 'allow' | 'deny'): Promise<ControlResponse> { return this.control({ kind: 'permission_reply', requestId: crypto.randomUUID(), permissionId, decision }) }
   async pairingOffer(): Promise<PairingOffer> { return this.post<PairingOffer>('/v1/pairing/offer', {}) }
-  async pair(code: string, name: string): Promise<{ device: DeviceInfo; token: string; refreshToken: string }> { const result = await this.post<{ device: DeviceInfo; token: string; refreshToken: string }>('/v1/pair', { code, name }); this.setCredentials(result); return result }
+  async pair(code: string, name: string, offer?: PairingOffer): Promise<{ device: DeviceInfo; token: string; refreshToken: string }> {
+    const value: Record<string, unknown> = { code, name }
+    if (offer !== undefined) {
+      const subtle = globalThis.crypto?.subtle
+      if (subtle === undefined) throw new Error('WebCrypto is required for a remote pairing QR offer')
+      const generated = await subtle.generateKey({ name: 'Ed25519' } as Algorithm, true, ['sign', 'verify']) as CryptoKeyPair
+      const publicKey = base64(await subtle.exportKey('spki', generated.publicKey))
+      const payload = new TextEncoder().encode(JSON.stringify({ version: 1, serverId: offer.serverId, serverPublicKey: offer.publicKey, offerId: offer.offerId, nonce: offer.nonce, identityPublicKey: publicKey }))
+      const proof = base64(await subtle.sign({ name: 'Ed25519' } as Algorithm, generated.privateKey, payload))
+      this.pairingIdentity = { privateKey: generated.privateKey, publicKey }
+      Object.assign(value, { offerId: offer.offerId, serverId: offer.serverId, serverPublicKey: offer.publicKey, identityPublicKey: publicKey, pairingProof: proof })
+    }
+    const result = await this.post<{ device: DeviceInfo; token: string; refreshToken: string }>('/v1/pair', value); this.setCredentials(result); return result
+  }
   async events(after = 0, generation?: string): Promise<EventPage> { return this.get<EventPage>(`/v1/events?after=${encodeURIComponent(String(after))}${generation === undefined ? '' : `&generation=${encodeURIComponent(generation)}`}`) }
   async rotateDevice(deviceId: string): Promise<{ device: DeviceInfo; token: string; refreshToken: string }> { const result = await this.post<{ device: DeviceInfo; token: string; refreshToken: string }>(`/v1/devices/${encodeURIComponent(deviceId)}/rotate`, {}); this.setCredentials(result); return result }
   async streamEvents(options: EventStreamOptions): Promise<void> {

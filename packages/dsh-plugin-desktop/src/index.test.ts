@@ -1,9 +1,39 @@
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { LocalDocumentProvider } from '@dshpilot/desktop-host'
-import { apply } from './index.js'
+import { LocalDocumentProvider, McpManager } from '@dshpilot/desktop-host'
+import { apply, liveMcpRecords, reconcileMcpLoader } from './index.js'
+
+interface FixtureEntry {
+  id: string
+  options: { name: string; config?: unknown; disabled?: boolean }
+  fiber?: { state?: number }
+}
+
+function fixtureLoader(initial: FixtureEntry[] = []) {
+  const entries = [...initial]
+  let nextId = 0
+  let updates = 0
+  return {
+    entries: () => entries,
+    async create(options: { name: string; config?: unknown; disabled?: boolean }): Promise<string> {
+      const id = `fixture-${nextId++}`
+      entries.push({ id, options, fiber: { state: 2 } })
+      return id
+    },
+    async update(id: string, options: { config?: unknown; disabled?: boolean }): Promise<void> {
+      const entry = entries.find(candidate => candidate.id === id)
+      if (entry === undefined) throw new Error(`unknown fixture entry ${id}`)
+      entry.options = { ...entry.options, ...options }; entry.fiber = { state: 2 }; updates += 1
+    },
+    async remove(id: string): Promise<void> {
+      const index = entries.findIndex(candidate => candidate.id === id)
+      if (index >= 0) entries.splice(index, 1)
+    },
+    get updates(): number { return updates },
+  }
+}
 
 describe('DSHPilot Host plugin document tool seam', () => {
   it('registers all document tools with the official tools registry and keeps bodies on demand', async () => {
@@ -25,5 +55,42 @@ describe('DSHPilot Host plugin document tool seam', () => {
       else process.env.DSH_HOME = previous
     }
   })
-})
 
+  it('reconciles a persisted MCP record through the official Loader and ToolRuntime fixture seams', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'dshpilot-mcp-fixture-')); const previous = process.env.DSH_HOME; process.env.DSH_HOME = home
+    try {
+      const manager = new McpManager(home)
+      await manager.upsert({
+        id: 'fixture-server', serverName: 'fixture_server', transport: 'stdio', enabled: true, status: 'configured',
+        command: 'fixture-mcp', args: [], env: {}, envRefs: { MCP_TOKEN: 'DSHPILOT_MCP_TOKEN' }, headers: {}, headerRefs: {}, updatedAt: new Date().toISOString(),
+      })
+      const loader = fixtureLoader()
+      const definitions: Array<Record<string, unknown>> = []
+      const credentials = { resolve: async (ref: string) => ref === 'DSHPILOT_MCP_TOKEN' ? { value: 'fixture-secret', source: 'fixture' } : undefined }
+      await apply({
+        loader,
+        credentials,
+        tools: {
+          register(definition) { definitions.push(definition as Record<string, unknown>); return () => undefined },
+          schemas: () => [{ name: 'mcp__fixture_server__search' }],
+        },
+        webServer: { register() { return () => undefined } },
+        effect(callback) { callback() },
+      })
+      expect(loader.entries()).toHaveLength(1)
+      expect((loader.entries()[0]!.options.config as { env: Record<string, string> }).env).toEqual({ MCP_TOKEN: 'fixture-secret' })
+      expect(await readFile(manager.statePath, 'utf8')).not.toContain('fixture-secret')
+      expect(definitions).toHaveLength(6)
+
+      const records = await manager.list()
+      expect(liveMcpRecords({ loader, tools: { register: () => () => undefined, schemas: () => [{ name: 'mcp__fixture_server__search' }] } }, records)[0]).toMatchObject({
+        status: 'ready', toolCount: 1, statusSource: 'loader-fiber', toolCountSource: 'tools-registry',
+      })
+      expect((await reconcileMcpLoader({ loader, credentials }, records)).reloaded).toBe(false)
+      expect(loader.updates).toBe(0)
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
+  })
+})

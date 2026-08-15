@@ -1,11 +1,11 @@
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir } from 'node:fs/promises'
 import { crc32 } from 'node:zlib'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
-  LocalDocumentProvider, LocalDocumentTools, McpManager, assertSafeRelativePath, createDesktopNotification, estimateTokens, inspectTokenUsage,
-  officialMcpPluginConfig, parseMcpImport, renderMcpPatch, shouldNotify,
+  IsolatedDocumentTools, LocalDocumentProvider, LocalDocumentTools, McpManager, ParserWorkerError, assertSafeRelativePath, createDesktopNotification, estimateTokens, inspectTokenUsage,
+  officialMcpPluginConfig, parseMcpImport, renderMcpPatch, resolveOfficialMcpPluginConfig, shouldNotify,
 } from './index.js'
 
 function zip(files: Record<string, string>): Uint8Array {
@@ -32,6 +32,20 @@ describe('MCP manager and import', () => {
     expect(patch).toContain('@deepseek-ai/dsh-mcp-client')
     expect(patch).toContain('"MODE": "readonly"')
     expect(patch).not.toContain('sk-live-secret')
+  })
+
+  it('resolves credential references only in the in-memory official plugin config', async () => {
+    const preview = parseMcpImport(JSON.stringify({ mcpServers: {
+      secure: { command: 'fixture-mcp', env: { MCP_TOKEN: '${DSHPILOT_MCP_TOKEN}', MODE: 'readonly' } },
+    } }))
+    const record = preview.servers[0]!
+    const config = await resolveOfficialMcpPluginConfig(record, {
+      resolve: async ref => ref === 'DSHPILOT_MCP_TOKEN' ? { value: 'secret-only-in-memory', source: 'fixture' } : undefined,
+    })
+    expect(config.env).toEqual({ MODE: 'readonly', MCP_TOKEN: 'secret-only-in-memory' })
+    expect(JSON.stringify(record)).not.toContain('secret-only-in-memory')
+    expect(renderMcpPatch([record])).toContain('process.env.DSHPILOT_MCP_TOKEN')
+    await expect(resolveOfficialMcpPluginConfig(record, { resolve: async () => undefined })).rejects.toThrow('credential reference')
   })
 
   it('requires explicit confirmation before import and persists the overlay atomically', async () => {
@@ -89,6 +103,58 @@ describe('document provider and notifications', () => {
     const pdf = await provider.addBytes(new TextEncoder().encode('%PDF-1.7 /Type /Page (Hello PDF)'), 'note.pdf')
     expect((await tools.inspect(pdf)).pages).toBe(1)
     expect((await tools.search(docx, 'docx')).matches[0]?.line).toBe(1)
+  })
+
+  it('runs PDF, Office, and CSV calls in a killable subprocess with hard timeout cleanup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-parser-timeout-root-'))
+    const provider = new LocalDocumentProvider(root)
+    const documents = [
+      { name: 'timeout.pdf', data: new TextEncoder().encode('%PDF-1.7 /Type /Page (timeout)') },
+      { name: 'timeout.docx', data: zip({ 'word/document.xml': '<document><body>timeout</body></document>' }) },
+      { name: 'timeout.csv', data: new TextEncoder().encode('a,b\n1,2\n') },
+    ]
+    const hangingWorker = { executable: process.execPath, args: ['-e', 'process.stdin.resume(); setInterval(() => {}, 1000)'] }
+    for (const document of documents) {
+      const manifest = await provider.addBytes(document.data, document.name)
+      const tools = new IsolatedDocumentTools(provider, 200_000, { tempRoot: root, timeoutMs: 150, workerCommand: hangingWorker })
+      await expect(tools.inspect(manifest)).rejects.toMatchObject({ code: 'timeout' })
+    }
+    expect(await readdir(root)).toEqual(['documents'])
+  })
+
+  it('turns a parser crash into a typed error and removes the private request directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-parser-crash-root-'))
+    const provider = new LocalDocumentProvider(root)
+    const manifest = await provider.addBytes(new TextEncoder().encode('a,b\n1,2\n'), 'crash.csv')
+    const tools = new IsolatedDocumentTools(provider, 200_000, {
+      tempRoot: root,
+      workerCommand: { executable: process.execPath, args: ['-e', 'process.exit(23)'] },
+    })
+    const error = await tools.read(manifest).catch(value => value)
+    expect(error).toBeInstanceOf(ParserWorkerError)
+    expect(error).toMatchObject({ code: 'crashed' })
+    expect(await readdir(root)).toEqual(['documents'])
+  })
+
+  it('uses 0700 request directories and 0600 input files', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dshpilot-parser-permissions-root-'))
+    const probe = join(root, 'probe.json')
+    const provider = new LocalDocumentProvider(root)
+    const manifest = await provider.addBytes(new TextEncoder().encode('a,b\n1,2\n'), 'permissions.csv')
+    const script = [
+      "let input=''; process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => {",
+      "const fs = require('node:fs'); const path = require('node:path'); const request = JSON.parse(input);",
+      "fs.writeFileSync(process.env.DSHPILOT_PROBE, JSON.stringify({ directory: fs.statSync(path.dirname(request.inputPath)).mode & 0o777, file: fs.statSync(request.inputPath).mode & 0o777 }));",
+      "process.stdout.write(JSON.stringify({ ok: true, value: { attachmentId: request.manifest.attachmentId, name: request.manifest.name, kind: request.manifest.kind, bytes: request.manifest.bytes, textCharacters: 0, manifestOnly: true } })); });",
+    ].join(' ')
+    const tools = new IsolatedDocumentTools(provider, 200_000, {
+      tempRoot: root,
+      workerCommand: { executable: process.execPath, args: ['-e', script], env: { DSHPILOT_PROBE: probe } },
+    })
+    await tools.inspect(manifest)
+    const modes = JSON.parse(await readFile(probe, 'utf8')) as { directory: number; file: number }
+    if (process.platform !== 'win32') expect(modes).toEqual({ directory: 0o700, file: 0o600 })
+    expect(await readdir(root)).toEqual(['documents', 'probe.json'])
   })
 
   it('renders the official MCP plugin configuration including reconnect policy', () => {

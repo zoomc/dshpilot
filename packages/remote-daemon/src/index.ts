@@ -1,4 +1,4 @@
-import { createHash, generateKeyPairSync, randomBytes, randomUUID, timingSafeEqual, type KeyObject } from 'node:crypto'
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, randomUUID, timingSafeEqual, type KeyObject } from 'node:crypto'
 import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createServer as createSecureServer } from 'node:https'
@@ -6,12 +6,12 @@ import { readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { WebSocketServer, type RawData, type WebSocket } from 'ws'
 import {
-  assertControlRequest, CONTROL_PROTOCOL_VERSION, type ControlEvent, type ControlEventType, type ControlRequest,
+  assertControlRequest, CONTROL_PROTOCOL_VERSION, type ControlEvent, type ControlEventType, type ControlRequest, type DevicePairingRequest,
   type ControlResponse, type ControlScope, type DeviceInfo, type PairingOffer, type RuntimeStatus, type ServerInfo,
   type EventPage, type SessionSummary, type TaskSummary, type PermissionSummary,
 } from '@dshpilot/control-contracts'
 export * from './relay.js'
-import { RelayRouter, verifyRelayHandshake, type RelayHandshake } from './relay.js'
+import { RelayRouter, signRelayReady, verifyPairingProof, verifyRelayHandshake, type RelayHandshake, type RelayHandshakeExpectations, type RelayIdentity } from './relay.js'
 
 interface EventStoreOptions { filePath?: string; maxEvents?: number; maxFileBytes?: number }
 
@@ -122,7 +122,7 @@ interface StoredDevice extends DeviceInfo {
   accessExpiresAt: string
   refreshExpiresAt: string
 }
-interface DeviceFile { serverId: string; publicKey: string; privateKey: string; devices: StoredDevice[] }
+interface DeviceFile { schemaVersion: 1; serverId: string; publicKey: string; privateKey: string; devices: StoredDevice[] }
 
 function hashToken(token: string): Buffer { return createHash('sha256').update(token).digest() }
 function redactLegacyEvent(event: ControlEvent): ControlEvent {
@@ -153,6 +153,7 @@ export class DeviceRegistry {
   constructor(private readonly filePath?: string) {
     const pair = generateKeyPairSync('ed25519')
     this.state = {
+      schemaVersion: 1,
       serverId: randomUUID(),
       publicKey: pair.publicKey.export({ format: 'der', type: 'spki' }).toString('base64'),
       privateKey: pair.privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64'),
@@ -165,7 +166,11 @@ export class DeviceRegistry {
     try {
       const value = JSON.parse(await readFile(this.filePath, 'utf8')) as DeviceFile
       if (!value.serverId || !value.publicKey || !value.privateKey || !Array.isArray(value.devices)) throw new Error('device registry is malformed')
-      this.state = value
+      const privateKey = createPrivateKey({ key: Buffer.from(value.privateKey, 'base64'), format: 'der', type: 'pkcs8' })
+      const derivedPublicKey = createPublicKey(privateKey).export({ format: 'der', type: 'spki' }).toString('base64')
+      if (derivedPublicKey !== value.publicKey) throw new Error('device registry server key binding is invalid')
+      for (const device of value.devices) if (device.identityPublicKey !== undefined) createPublicKey({ key: Buffer.from(device.identityPublicKey, 'base64'), format: 'der', type: 'spki' })
+      this.state = { ...value, schemaVersion: 1 }
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
   }
 
@@ -182,6 +187,9 @@ export class DeviceRegistry {
 
   serverId(): string { return this.state.serverId }
   publicKey(): string { return this.state.publicKey }
+  serverIdentity(): RelayIdentity {
+    return { privateKey: createPrivateKey({ key: Buffer.from(this.state.privateKey, 'base64'), format: 'der', type: 'pkcs8' }), publicKey: this.state.publicKey }
+  }
   list(): DeviceInfo[] { return this.state.devices.map(({ tokenHash: _tokenHash, refreshHash: _refreshHash, ...device }) => device) }
 
   createOffer(ttlMs = 120_000): PairingOffer {
@@ -196,13 +204,23 @@ export class DeviceRegistry {
     return offer
   }
 
-  async pair(code: string, name: string, scopes: readonly ControlScope[] = ['read', 'control']): Promise<{ device: DeviceInfo; token: string; refreshToken: string }> {
+  async pair(request: DevicePairingRequest | string, name?: string, scopes: readonly ControlScope[] = ['read', 'control'], options: { requireIdentity?: boolean } = {}): Promise<{ device: DeviceInfo; token: string; refreshToken: string }> {
+    const input: DevicePairingRequest = typeof request === 'string' ? { code: request, name: name ?? '', scopes } : request
     const pending = this.pending
-    if (pending === undefined || Date.now() > pending.expiresMs || createHash('sha256').update(code).digest('hex') !== pending.codeHash) throw new Error('pairing offer is invalid or expired')
+    const suppliedCodeHash = createHash('sha256').update(input.code).digest('hex')
+    if (pending === undefined || Date.now() > pending.expiresMs || !sameHexHash(suppliedCodeHash, pending.codeHash)) throw new Error('pairing offer is invalid or expired')
+    const hasIdentity = input.identityPublicKey !== undefined || input.pairingProof !== undefined || input.offerId !== undefined || input.serverId !== undefined || input.serverPublicKey !== undefined
+    if (options.requireIdentity && !hasIdentity) throw new Error('device identity is required for remote pairing')
+    if (hasIdentity) {
+      if (input.identityPublicKey === undefined || input.pairingProof === undefined || input.offerId !== pending.offerId || input.serverId !== this.state.serverId || input.serverPublicKey !== this.state.publicKey) throw new Error('pairing server key binding is invalid')
+      verifyPairingProof({ serverId: this.state.serverId, serverPublicKey: this.state.publicKey, offerId: pending.offerId, nonce: pending.nonce, identityPublicKey: input.identityPublicKey }, input.pairingProof)
+    }
     this.pending = undefined
     const token = accessToken(); const nextRefreshToken = refreshToken()
     const now = Date.now()
-    const device: StoredDevice = { deviceId: randomUUID(), name: name.trim().slice(0, 80) || 'Unnamed device', scopes: [...new Set(scopes)].filter(scope => ['read', 'control', 'admin'].includes(scope)), createdAt: new Date().toISOString(), accessExpiresAt: new Date(now + ACCESS_TTL_MS).toISOString(), refreshExpiresAt: new Date(now + REFRESH_TTL_MS).toISOString(), tokenHash: hashToken(token).toString('hex'), refreshHash: hashToken(nextRefreshToken).toString('hex') }
+    const allowedScopes: ControlScope[] = ['read', 'control', 'admin']
+    const requestedScopes: readonly ControlScope[] = input.scopes ?? ['read', 'control']
+    const device: StoredDevice = { deviceId: randomUUID(), name: input.name.trim().slice(0, 80) || 'Unnamed device', ...(input.identityPublicKey === undefined ? {} : { identityPublicKey: input.identityPublicKey }), scopes: [...new Set(requestedScopes)].filter((scope): scope is ControlScope => allowedScopes.includes(scope)), createdAt: new Date().toISOString(), accessExpiresAt: new Date(now + ACCESS_TTL_MS).toISOString(), refreshExpiresAt: new Date(now + REFRESH_TTL_MS).toISOString(), tokenHash: hashToken(token).toString('hex'), refreshHash: hashToken(nextRefreshToken).toString('hex') }
     this.state.devices.push(device)
     await this.save()
     const { tokenHash: _tokenHash, refreshHash: _refreshHash, ...publicDevice } = device
@@ -243,6 +261,11 @@ export class DeviceRegistry {
   }
 }
 
+function sameHexHash(left: string, right: string): boolean {
+  const a = Buffer.from(left, 'hex'); const b = Buffer.from(right, 'hex')
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
 export interface ControlPlaneAdapter {
   runtimeStatus: () => RuntimeStatus
   sessions: () => Promise<SessionSummary[]>
@@ -258,6 +281,19 @@ export interface ControlPlaneAdapter {
   resources?: () => Promise<unknown[]>
   lineage?: (sessionId: string) => Promise<unknown[]>
 }
+
+export interface ResourceAuthorizationContext {
+  device?: DeviceInfo
+  scope: ControlScope
+  operation: string
+  sessionId?: string
+  workspaceId?: string
+  cwd?: string
+  artifactId?: string
+  request?: ControlRequest
+}
+
+export type AuthorizationDecision = boolean | { allowed: boolean; code?: string; message?: string }
 
 export interface ControlPlaneServerOptions {
   version: string
@@ -277,6 +313,10 @@ export interface ControlPlaneServerOptions {
   maxSseConnections?: number
   /** Enable the optional opaque WebSocket relay transport. */
   relayEnabled?: boolean
+  /** Require a client identity proof when pairing from a non-loopback peer. */
+  requireDeviceIdentityOnRemotePairing?: boolean
+  /** Resource-level authorization seam; returning false is fail-closed. */
+  authorization?: (context: ResourceAuthorizationContext) => AuthorizationDecision | Promise<AuthorizationDecision>
   adapter?: Partial<ControlPlaneAdapter>
 }
 
@@ -295,7 +335,7 @@ export class ControlPlaneServer {
   private activeSseConnections = 0
 
   constructor(options: ControlPlaneServerOptions) {
-    this.options = { host: '127.0.0.1', port: 0, remoteEnabled: false, allowLocalAdminPairing: false, allowLocalPairingOffer: false, maxSseConnections: 8, ...options }
+    this.options = { host: '127.0.0.1', port: 0, remoteEnabled: false, allowLocalAdminPairing: false, allowLocalPairingOffer: false, maxSseConnections: 8, requireDeviceIdentityOnRemotePairing: true, ...options }
     if (!this.options.remoteEnabled && !isLoopbackHost(this.options.host)) throw new Error('remote mode must be explicitly enabled before binding a non-loopback host')
     if (this.options.remoteEnabled && !isLoopbackHost(this.options.host) && this.options.tls === undefined) throw new Error('remote mode requires TLS key/cert when binding a non-loopback host')
     this.events = new DurableEventStore({ filePath: this.options.eventsPath })
@@ -333,18 +373,18 @@ export class ControlPlaneServer {
       if (url.pathname === '/health' && request.method === 'GET') { this.json(response, 200, { ok: true, protocolVersion: CONTROL_PROTOCOL_VERSION }); return }
       if (url.pathname === '/v1/server' && request.method === 'GET') { this.authorize(request, 'read'); this.json(response, 200, { ok: true, value: this.serverInfo() }); return }
       if (url.pathname === '/v1/runtime' && request.method === 'GET') { this.authorize(request, 'read'); this.json(response, 200, { ok: true, value: this.options.adapter?.runtimeStatus?.() ?? { state: 'idle', restartCount: 0 } }); return }
-      if (url.pathname === '/v1/sessions' && request.method === 'GET') { this.authorize(request, 'read'); this.json(response, 200, { ok: true, value: await (this.options.adapter?.sessions?.() ?? Promise.resolve([])) }); return }
-      if (url.pathname === '/v1/tasks' && request.method === 'GET') { this.authorize(request, 'read'); this.json(response, 200, { ok: true, value: await (this.options.adapter?.tasks?.() ?? Promise.resolve([])) }); return }
-      if (url.pathname === '/v1/permissions' && request.method === 'GET') { this.authorize(request, 'read'); this.json(response, 200, { ok: true, value: await (this.options.adapter?.permissions?.(url.searchParams.get('sessionId') ?? undefined) ?? Promise.resolve([])) }); return }
-      if (url.pathname === '/v1/artifacts' && request.method === 'GET') { this.authorize(request, 'read'); this.json(response, 200, { ok: true, value: await (this.options.adapter?.artifacts?.() ?? Promise.resolve([])) }); return }
-      if (url.pathname === '/v1/git' && request.method === 'GET') { this.authorize(request, 'read'); if (this.options.adapter?.git === undefined) throw new Error('git adapter is not configured'); this.json(response, 200, { ok: true, value: await this.options.adapter.git(url.searchParams.get('cwd') ?? '', url.searchParams.get('path') ?? undefined) }); return }
-      if (url.pathname === '/v1/resources' && request.method === 'GET') { this.authorize(request, 'read'); this.json(response, 200, { ok: true, value: await (this.options.adapter?.resources?.() ?? Promise.resolve([])) }); return }
-      if (url.pathname.startsWith('/v1/sessions/') && url.pathname.endsWith('/lineage') && request.method === 'GET') { this.authorize(request, 'read'); const sessionId = decodeURIComponent(url.pathname.slice('/v1/sessions/'.length, -'/lineage'.length)); this.json(response, 200, { ok: true, value: await (this.options.adapter?.lineage?.(sessionId) ?? Promise.resolve([])) }); return }
-      if (url.pathname.startsWith('/v1/artifacts/') && request.method === 'GET') { this.authorize(request, 'read'); if (this.options.adapter?.artifactRead === undefined) throw new Error('artifact adapter is not configured'); const data = await this.options.adapter.artifactRead(decodeURIComponent(url.pathname.slice('/v1/artifacts/'.length))); response.writeHead(200, { 'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'content-length': data.byteLength }); response.end(Buffer.from(data)); return }
+      if (url.pathname === '/v1/sessions' && request.method === 'GET') { await this.authorizeResource(request, 'read', { operation: 'session_list' }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.sessions?.() ?? Promise.resolve([])) }); return }
+      if (url.pathname === '/v1/tasks' && request.method === 'GET') { await this.authorizeResource(request, 'read', { operation: 'task_list' }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.tasks?.() ?? Promise.resolve([])) }); return }
+      if (url.pathname === '/v1/permissions' && request.method === 'GET') { const sessionId = url.searchParams.get('sessionId') ?? undefined; await this.authorizeResource(request, 'read', { operation: 'permission_list', ...(sessionId === undefined ? {} : { sessionId }) }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.permissions?.(sessionId) ?? Promise.resolve([])) }); return }
+      if (url.pathname === '/v1/artifacts' && request.method === 'GET') { await this.authorizeResource(request, 'read', { operation: 'artifact_list' }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.artifacts?.() ?? Promise.resolve([])) }); return }
+      if (url.pathname === '/v1/git' && request.method === 'GET') { const cwd = url.searchParams.get('cwd') ?? ''; await this.authorizeResource(request, 'read', { operation: 'git_summary', cwd }); if (this.options.adapter?.git === undefined) throw new Error('git adapter is not configured'); this.json(response, 200, { ok: true, value: await this.options.adapter.git(cwd, url.searchParams.get('path') ?? undefined) }); return }
+      if (url.pathname === '/v1/resources' && request.method === 'GET') { await this.authorizeResource(request, 'read', { operation: 'resource_list' }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.resources?.() ?? Promise.resolve([])) }); return }
+      if (url.pathname.startsWith('/v1/sessions/') && url.pathname.endsWith('/lineage') && request.method === 'GET') { const sessionId = decodeURIComponent(url.pathname.slice('/v1/sessions/'.length, -'/lineage'.length)); await this.authorizeResource(request, 'read', { operation: 'session_lineage', sessionId }); this.json(response, 200, { ok: true, value: await (this.options.adapter?.lineage?.(sessionId) ?? Promise.resolve([])) }); return }
+      if (url.pathname.startsWith('/v1/artifacts/') && request.method === 'GET') { const artifactId = decodeURIComponent(url.pathname.slice('/v1/artifacts/'.length)); await this.authorizeResource(request, 'read', { operation: 'artifact_read', artifactId }); if (this.options.adapter?.artifactRead === undefined) throw new Error('artifact adapter is not configured'); const data = await this.options.adapter.artifactRead(artifactId); response.writeHead(200, { 'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'content-length': data.byteLength }); response.end(Buffer.from(data)); return }
       if (url.pathname === '/v1/events' && request.method === 'GET') { this.authorize(request, 'read'); this.json(response, 200, { ok: true, value: this.events.page(Number(url.searchParams.get('after') ?? 0), Number(url.searchParams.get('limit') ?? 500), url.searchParams.get('generation') ?? undefined) }); return }
       if (url.pathname === '/v1/events/stream' && request.method === 'GET') { this.authorize(request, 'read'); await this.sse(request, response, Number(url.searchParams.get('after') ?? request.headers['last-event-id'] ?? 0), url.searchParams.get('generation') ?? undefined); return }
       if (url.pathname === '/v1/pairing/offer' && request.method === 'POST') { this.authorizeLocalOrAdmin(request); this.json(response, 200, { ok: true, value: this.devices.createOffer() }); return }
-      if (url.pathname === '/v1/pair' && request.method === 'POST') { const local = this.authorizePairRequest(request); const body = await readJson(request); const requestedScopes = Array.isArray(body.scopes) ? body.scopes as ControlScope[] : undefined; const scopes = local && this.options.allowLocalAdminPairing ? requestedScopes : requestedScopes?.filter(scope => scope !== 'admin'); const result = await this.devices.pair(String(body.code ?? ''), String(body.name ?? ''), scopes); this.events.append('device.paired', { deviceId: result.device.deviceId, name: result.device.name }); this.json(response, 200, { ok: true, value: result }); return }
+      if (url.pathname === '/v1/pair' && request.method === 'POST') { const local = this.authorizePairRequest(request); const body = await readJson(request); const requestedScopes = Array.isArray(body.scopes) ? body.scopes as ControlScope[] : undefined; const scopes = local && this.options.allowLocalAdminPairing ? requestedScopes : requestedScopes?.filter(scope => scope !== 'admin'); const pairing: DevicePairingRequest = { code: String(body.code ?? ''), name: String(body.name ?? ''), ...(scopes === undefined ? {} : { scopes }), ...(typeof body.offerId === 'string' ? { offerId: body.offerId } : {}), ...(typeof body.serverId === 'string' ? { serverId: body.serverId } : {}), ...(typeof body.serverPublicKey === 'string' ? { serverPublicKey: body.serverPublicKey } : {}), ...(typeof body.identityPublicKey === 'string' ? { identityPublicKey: body.identityPublicKey } : {}), ...(typeof body.pairingProof === 'string' ? { pairingProof: body.pairingProof } : {}) }; const result = await this.devices.pair(pairing, undefined, ['read', 'control'], { requireIdentity: !local && this.options.requireDeviceIdentityOnRemotePairing === true }); this.events.append('device.paired', { deviceId: result.device.deviceId, name: result.device.name }); this.json(response, 200, { ok: true, value: result }); return }
       if (url.pathname === '/v1/token/refresh' && request.method === 'POST') { const body = await readJson(request); const result = await this.devices.refresh(String(body.deviceId ?? ''), String(body.refreshToken ?? '')); this.json(response, 200, { ok: true, value: result }); return }
       if (url.pathname === '/v1/devices' && request.method === 'GET') { this.authorize(request, 'admin'); this.json(response, 200, { ok: true, value: this.devices.list() }); return }
       if (url.pathname.startsWith('/v1/devices/') && request.method === 'DELETE') { this.authorize(request, 'admin'); const device = await this.devices.revoke(decodeURIComponent(url.pathname.slice('/v1/devices/'.length))); this.events.append('device.revoked', { deviceId: device.deviceId }); this.json(response, 200, { ok: true, value: device }); return }
@@ -361,7 +401,7 @@ export class ControlPlaneServer {
 
   private async control(request: IncomingMessage, value: ControlRequest): Promise<ControlResponse> {
     const scope: ControlScope = value.kind === 'device_list' || value.kind === 'device_revoke' || value.kind === 'device_rotate' ? 'admin' : value.kind === 'prompt_admission' || value.kind === 'interrupt' || value.kind === 'permission_reply' || value.kind === 'question_reply' ? 'control' : 'read'
-    this.authorize(request, scope)
+    await this.authorizeResource(request, scope, { request: value, operation: value.kind, ...(value.kind === 'prompt_admission' ? { sessionId: value.sessionId, workspaceId: value.workspaceId, cwd: value.cwd } : value.kind === 'interrupt' ? { sessionId: value.sessionId, workspaceId: value.workspaceId } : value.kind === 'permission_list' ? { sessionId: value.sessionId, workspaceId: value.workspaceId } : value.kind === 'question_reply' ? { sessionId: value.sessionId, workspaceId: value.workspaceId } : {}) })
     if (value.kind === 'events') return { ok: true, value: this.events.list(value.after, value.limit) }
     if (value.kind === 'server_info') return { ok: true, value: this.serverInfo() }
     if (value.kind === 'runtime_status') return { ok: true, value: this.options.adapter?.runtimeStatus?.() ?? { state: 'idle', restartCount: 0 } }
@@ -436,6 +476,16 @@ export class ControlPlaneServer {
     return false
   }
   private authorize(request: IncomingMessage, scope: ControlScope): DeviceInfo | undefined { if (this.options.remoteEnabled === false && isLoopbackHost(request.socket.remoteAddress ?? '')) return undefined; const token = request.headers.authorization?.replace(/^Bearer\s+/iu, ''); const device = this.devices.authorize(token, scope); if (device === undefined) throw new AuthError(); return device }
+  private async authorizeResource(request: IncomingMessage, scope: ControlScope, context: Omit<ResourceAuthorizationContext, 'device' | 'scope'>): Promise<DeviceInfo | undefined> {
+    const device = this.authorize(request, scope)
+    if (this.options.authorization === undefined) return device
+    const decision = await this.options.authorization({ ...context, device, scope })
+    if (decision === false || typeof decision === 'object' && decision.allowed !== true) {
+      const message = typeof decision === 'object' && decision.message !== undefined ? decision.message : 'remote resource is not authorized for this device'
+      throw new AuthError(message)
+    }
+    return device
+  }
   private async sse(request: IncomingMessage, response: ServerResponse, after: number, generation?: string): Promise<void> {
     if (this.activeSseConnections >= (this.options.maxSseConnections ?? 8)) throw new RateLimitError('too many event streams')
     this.activeSseConnections += 1
@@ -462,12 +512,12 @@ export class ControlPlaneServer {
     try {
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`)
       if (url.pathname !== '/v1/relay' || this.relayServer === undefined) { socket.destroy(); return }
-      this.authorize(request, 'control')
-      this.relayServer.handleUpgrade(request, socket, head, ws => this.handleRelayConnection(ws))
+      const device = this.authorize(request, 'control')
+      this.relayServer.handleUpgrade(request, socket, head, ws => this.handleRelayConnection(ws, device))
     } catch { socket.destroy() }
   }
 
-  private handleRelayConnection(ws: WebSocket): void {
+  private handleRelayConnection(ws: WebSocket, device?: DeviceInfo): void {
     const connectionId = randomUUID()
     let sessionId: string | undefined
     let unregister: (() => void) | undefined
@@ -480,10 +530,18 @@ export class ControlPlaneServer {
         if (sessionId === undefined) {
           if (value.type !== 'handshake' || typeof value.handshake !== 'object' || value.handshake === null) throw new Error('relay handshake is required')
           const handshake = value.handshake as RelayHandshake
-          verifyRelayHandshake(handshake)
+          verifyRelayHandshake(handshake, {
+            expectedServerId: this.devices.serverId(),
+            expectedServerPublicKey: this.devices.publicKey(),
+            ...(device?.identityPublicKey === undefined ? {} : { expectedDeviceId: device.deviceId, expectedIdentityPublicKey: device.identityPublicKey }),
+          })
           sessionId = handshake.sessionId
-          unregister = this.relayRouter.registerAuthenticated(sessionId, connectionId, handshake, frame => { if (ws.readyState === ws.OPEN) ws.send(frame) })
-          ws.send(JSON.stringify({ type: 'ready', version: 1, sessionId }))
+          unregister = this.relayRouter.registerAuthenticated(sessionId, connectionId, handshake, frame => { if (ws.readyState === ws.OPEN) ws.send(frame) }, {
+            expectedServerId: this.devices.serverId(),
+            expectedServerPublicKey: this.devices.publicKey(),
+            ...(device?.identityPublicKey === undefined ? {} : { expectedDeviceId: device.deviceId, expectedIdentityPublicKey: device.identityPublicKey }),
+          })
+          ws.send(JSON.stringify(signRelayReady(this.devices.serverIdentity(), handshake)))
           return
         }
         if (value.sessionId !== sessionId || value.version !== 1 || (value.direction !== 'client_to_server' && value.direction !== 'server_to_client') || !Number.isSafeInteger(value.frameSeq)
