@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "resources": {
+      "../../../runtime/current": "runtime",
+      "../../../runtime/current.json": "runtime/current.json"
+    }
+  }
+}

@@ -20,6 +20,7 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Manager, State,
 };
+use tauri_plugin_notification::NotificationExt;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -38,6 +39,9 @@ struct RuntimePaths {
     dsh_home: String,
     logs: String,
     runtime: String,
+    mcp_state: String,
+    mcp_patch: String,
+    documents: String,
 }
 
 fn copy_runtime_seed(source: &Path, destination: &Path) -> Result<(), String> {
@@ -70,12 +74,20 @@ fn app_paths(app: &AppHandle) -> Result<RuntimePaths, String> {
         logs: app_data.join("logs").display().to_string(),
         runtime: app_data.join("runtime").display().to_string(),
         app_data: app_data.display().to_string(),
+        mcp_state: app_data.join("dsh-home").join("dshpilot").join("mcp-servers.json").display().to_string(),
+        mcp_patch: app_data.join("dsh-home").join("dshpilot").join("mcp.patch.yml").display().to_string(),
+        documents: app_data.join("dsh-home").join("documents").display().to_string(),
     };
     for path in [
         PathBuf::from(&paths.app_data),
         PathBuf::from(&paths.dsh_home),
+        PathBuf::from(&paths.dsh_home).join("dshpilot"),
+        PathBuf::from(&paths.documents),
         PathBuf::from(&paths.logs),
         PathBuf::from(&paths.runtime),
+        PathBuf::from(&paths.runtime).join("versions"),
+        PathBuf::from(&paths.runtime).join("staging"),
+        PathBuf::from(&paths.app_data).join("update"),
     ] {
         fs::create_dir_all(path).map_err(|error| format!("unable to create app data: {error}"))?;
     }
@@ -114,8 +126,12 @@ fn log_line(log_path: &Path, line: &str) {
 }
 
 fn dsh_command(_app: &AppHandle, paths: &RuntimePaths) -> Result<(PathBuf, Vec<String>), String> {
+    let patch_path = PathBuf::from(&paths.mcp_patch);
     if let Ok(path) = env::var("DSHPILOT_DSH_BIN") {
-        return Ok((PathBuf::from(path), vec!["web".into(), "--host".into(), "127.0.0.1".into(), "--port".into(), "0".into()]));
+        let mut args = vec!["web".into()];
+        if patch_path.exists() { args.extend(["--patch".into(), patch_path.display().to_string()]); }
+        args.extend(["--host".into(), "127.0.0.1".into(), "--port".into(), "0".into()]);
+        return Ok((PathBuf::from(path), args));
     }
 
     let current = PathBuf::from(&paths.runtime).join("current.json");
@@ -132,12 +148,15 @@ fn dsh_command(_app: &AppHandle, paths: &RuntimePaths) -> Result<(PathBuf, Vec<S
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "runtime manifest is missing runtimeVersion".to_string())?;
     let runtime_root = PathBuf::from(&paths.runtime).join("versions").join(runtime_id);
-    let node = runtime_root.join("node");
+    let node = runtime_root.join(if cfg!(windows) { "node.exe" } else { "node" });
     let dsh = runtime_root.join("dsh").join("lib").join("bin.js");
     if !node.exists() || !dsh.exists() {
         return Err(format!("runtime {runtime_id} is incomplete"));
     }
-    Ok((node, vec![dsh.display().to_string(), "web".into(), "--host".into(), "127.0.0.1".into(), "--port".into(), "0".into()]))
+    let mut args = vec![dsh.display().to_string(), "web".into()];
+    if patch_path.exists() { args.extend(["--patch".into(), patch_path.display().to_string()]); }
+    args.extend(["--host".into(), "127.0.0.1".into(), "--port".into(), "0".into()]);
+    Ok((node, args))
 }
 
 fn stop_child(running: &mut RunningHarness) {
@@ -286,6 +305,23 @@ fn runtime_paths(app: AppHandle) -> Result<RuntimePaths, String> {
     app_paths(&app)
 }
 
+#[tauri::command]
+fn native_notification(app: AppHandle, kind: String, title: String, body: String) -> Result<(), String> {
+    match kind.as_str() {
+        "task-completed" | "task-failed" | "approval-needed" | "question-needed" => {}
+        _ => return Err("unsupported notification kind".into()),
+    }
+    if title.trim().is_empty() || body.trim().is_empty() {
+        return Err("notification title and body are required".into());
+    }
+    app.notification()
+        .builder()
+        .title(title.trim())
+        .body(body.trim())
+        .show()
+        .map_err(|error| format!("unable to show notification: {error}"))
+}
+
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show DSHPilot", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -317,7 +353,7 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
         .manage(HarnessState::default())
-        .invoke_handler(tauri::generate_handler![harness_url, stop_harness, runtime_paths])
+        .invoke_handler(tauri::generate_handler![harness_url, stop_harness, runtime_paths, native_notification])
         .setup(|app| {
             setup_tray(app)?;
             Ok(())

@@ -33,11 +33,17 @@ function run(name: string, command: string, args: readonly string[], cwd: string
 }
 
 async function main(): Promise<void> {
-  const candidateSha = run('read-candidate', 'git', ['rev-parse', 'HEAD'], harnessRoot).trim()
+  if (process.env.DSHPILOT_UPSTREAM_CANDIDATE_SHA === undefined) {
+    run('fetch-upstream', 'git', ['fetch', '--depth=1', 'origin', 'master'], harnessRoot)
+  }
+  const candidateSha = process.env.DSHPILOT_UPSTREAM_CANDIDATE_SHA
+    ?? run('read-candidate', 'git', ['rev-parse', 'origin/master'], harnessRoot).trim()
+  if (candidateSha !== UPSTREAM_TESTED_SHA) run('checkout-candidate', 'git', ['checkout', '--detach', candidateSha], harnessRoot)
   if (candidateSha === UPSTREAM_TESTED_SHA) {
     console.log(JSON.stringify({ status: 'NO_CHANGE', stableSha: UPSTREAM_TESTED_SHA, version: UPSTREAM_TESTED_VERSION }))
     return
   }
+  const candidateVersion = JSON.parse(await readFile(join(harnessRoot, 'apps/cli/package.json'), 'utf8')).version as string
   const steps = [
     ['upstream-build', 'pnpm', ['run', 'typecheck'], harnessRoot],
     ['upstream-build', 'pnpm', ['run', 'build'], harnessRoot],
@@ -45,6 +51,7 @@ async function main(): Promise<void> {
     ['build', 'pnpm', ['run', 'build'], projectRoot],
     ['unit', 'pnpm', ['test'], projectRoot],
     ['web-smoke', 'pnpm', ['smoke'], projectRoot],
+    ['desktop-integration', 'cargo', ['check', '--manifest-path', 'apps/desktop/src-tauri/Cargo.toml'], projectRoot],
     ['runtime-bundle', 'pnpm', ['runtime:bundle', '--', '--output', 'artifacts/guardian/runtime'], projectRoot],
   ] as const
   const diagnostics: string[] = []
@@ -58,10 +65,10 @@ async function main(): Promise<void> {
     const manifest = await readFile(manifestPath, 'utf8')
     const promoted = manifest
       .replace(/UPSTREAM_TESTED_SHA = '[^']+'/u, `UPSTREAM_TESTED_SHA = '${candidateSha}'`)
-      .replace(/UPSTREAM_TESTED_VERSION = '[^']+'/u, `UPSTREAM_TESTED_VERSION = '${UPSTREAM_TESTED_VERSION}'`)
+      .replace(/UPSTREAM_TESTED_VERSION = '[^']+'/u, `UPSTREAM_TESTED_VERSION = '${candidateVersion}'`)
     await writeFile(manifestPath, promoted)
   }
-  console.log(JSON.stringify({ status: 'PASS', stableSha: UPSTREAM_TESTED_SHA, candidateSha, report: join(reportDir, `${candidateSha}.json`) }, null, 2))
+  console.log(JSON.stringify({ status: 'PASS', stableSha: UPSTREAM_TESTED_SHA, candidateSha, candidateVersion, report: join(reportDir, `${candidateSha}.json`) }, null, 2))
 }
 
 void main().catch(error => { console.error(String(error)); process.exitCode = 1 })

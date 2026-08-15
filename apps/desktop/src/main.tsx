@@ -10,6 +10,11 @@ function App() {
     void invoke<string>('harness_url').then((url) => {
       if (!cancelled) window.location.replace(url)
     }).catch((error: unknown) => {
+      void invoke('native_notification', {
+        kind: 'task-failed',
+        title: 'DSHPilot could not start Harness',
+        body: String(error),
+      }).catch(() => undefined)
       if (!cancelled) setStatus(`Unable to start Harness: ${String(error)}`)
     })
     return () => { cancelled = true }

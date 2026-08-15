@@ -1,4 +1,4 @@
-import { copyFile, cp, lstat, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { copyFile, cp, lstat, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { globSync } from 'node:fs'
 import { createHash, sign } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
@@ -135,6 +135,35 @@ async function linkVirtualStorePackages(deploymentRoot: string): Promise<void> {
   }
 }
 
+/**
+ * Tauri resources must be self-contained and cannot contain pnpm's absolute
+ * virtual-store links. Resolve the root package links into real directories,
+ * omit nested node_modules (the flattened root contains every deployed
+ * package), then remove the virtual store. This also prevents resource
+ * scanners on Windows from following peer links back into an ancestor.
+ */
+async function flattenNodeModuleLinks(deploymentRoot: string): Promise<void> {
+  const nodeModules = join(deploymentRoot, 'node_modules')
+  async function flatten(path: string): Promise<void> {
+    const info = await lstat(path)
+    if (info.isSymbolicLink()) {
+      const target = await realpath(path)
+      const targetInfo = await lstat(target)
+      await rm(path, { recursive: true, force: true })
+      if (targetInfo.isDirectory()) {
+        await cp(target, path, { recursive: true, dereference: true, filter: candidate => relative(target, candidate) !== 'node_modules' && !relative(target, candidate).startsWith(`node_modules${process.platform === 'win32' ? '\\' : '/'}`) })
+      } else {
+        await copyFile(target, path)
+      }
+      return
+    }
+    if (!info.isDirectory() || path === join(nodeModules, '.pnpm')) return
+    for (const entry of await readdir(path)) await flatten(join(path, entry))
+  }
+  await flatten(nodeModules)
+  await rm(join(nodeModules, '.pnpm'), { recursive: true, force: true })
+}
+
 async function removeSourceMaps(root: string): Promise<void> {
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const path = join(root, entry.name)
@@ -176,6 +205,7 @@ async function main(): Promise<void> {
   command('pnpm', ['deploy', '--legacy', '--filter', '@deepseek-ai/dsh', join(runtimeRoot, 'dsh')], harnessRoot)
   await materializeWorkspacePeers(join(runtimeRoot, 'dsh'))
   await linkVirtualStorePackages(join(runtimeRoot, 'dsh'))
+  await flattenNodeModuleLinks(join(runtimeRoot, 'dsh'))
   await removeSourceMaps(runtimeRoot)
   await removeRuntimeTypeArtifacts(runtimeRoot)
   const nodeVersion = process.env.DSHPILOT_NODE_VERSION ?? '22.19.0'

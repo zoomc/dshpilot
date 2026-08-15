@@ -176,3 +176,8 @@ export async function downloadAndInstallRuntime(manifest: RuntimeManifest, point
 
 export function defaultAppDataRoot(): string { return process.env.DSHPILOT_APP_DATA ?? join(homedir(), 'Library', 'Application Support', 'DSHPilot') }
 export function testAppDataRoot(): string { return join(tmpdir(), 'dshpilot-test-data') }
+
+export * from './phase2/attachments.js'
+export * from './phase2/mcp.js'
+export * from './phase2/notifications.js'
+export * from './phase2/tokens.js'
