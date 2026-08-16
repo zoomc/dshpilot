@@ -70,13 +70,22 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: bash
         run: reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f || true
-      - name: Generate release build config
+      - name: Patch tauri.conf.json for release (platform-specific runtime path)
         shell: bash
         env:
           RES_SRC: ${{ matrix.os == 'windows-latest' && 'rt/current' || '../../../runtime/current' }}
           RES_JSON: ${{ matrix.os == 'windows-latest' && 'rt/current.json' || '../../../runtime/current.json' }}
         run: |
-          node -e 'const fs=require("fs"); fs.writeFileSync("apps/desktop/src-tauri/tauri.release.json", JSON.stringify({version: process.env.GITHUB_REF_NAME.replace(/^v/, ""), bundle: {createUpdaterArtifacts: false, resources: {[process.env.RES_SRC]: "runtime", [process.env.RES_JSON]: "runtime/current.json"}}}, null, 2));'
+          node -e '
+            const fs = require("fs");
+            const p = "apps/desktop/src-tauri/tauri.conf.json";
+            const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
+            cfg.version = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+            cfg.bundle = cfg.bundle || {};
+            cfg.bundle.createUpdaterArtifacts = false;
+            cfg.bundle.resources = { [process.env.RES_SRC]: "runtime", [process.env.RES_JSON]: "runtime/current.json" };
+            fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+          '
       - name: Compute release version (strip leading v)
         shell: bash
         run: echo "VERSION_NO_V=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
@@ -85,7 +94,7 @@ jobs:
       # mount step, which can hang in CI. No code-signing identity is required; Tauri
       # produces an ad-hoc signed app that runs fine (Gatekeeper prompts on first launch).
       - name: Build app bundle
-        run: pnpm tauri build --bundles ${{ matrix.bundles }} --config apps/desktop/src-tauri/tauri.release.json
+        run: pnpm tauri build --bundles ${{ matrix.bundles }}
       - name: Package macOS disk image
         if: matrix.os == 'macos-14'
         shell: bash
