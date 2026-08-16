@@ -13,6 +13,7 @@
 //!    existing `runtime_update_from_url` path.
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -251,6 +252,14 @@ pub fn check_dsh_core_update(app: AppHandle) -> DshCoreUpdateCheck {
 
 #[tauri::command]
 pub fn install_app_update(app: AppHandle, asset_url: String) -> Result<(), String> {
+    // The in-app swap uses a detached Unix shell script (setsid + ditto/open);
+    // on Windows the installer is distributed via the nsis package on the
+    // release page, so we degrade gracefully instead of failing mid-flight.
+    if cfg!(target_os = "windows") {
+        return Err(
+            "应用内自动更新暂不支持 Windows，请前往 GitHub Releases 手动下载安装包".into(),
+        );
+    }
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(600))

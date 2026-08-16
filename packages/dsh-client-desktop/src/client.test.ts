@@ -15,7 +15,7 @@ describe('DSHPilot Client Harness slot seam', () => {
     const ctx = {
       slots: {
         inject(key: string, setup: () => unknown): unknown {
-          expect(['conversation.composer.dock', 'sidebar.footer.action']).toContain(key)
+          expect(['conversation.composer.dock', 'sidebar.footer.action', 'settings.section']).toContain(key)
           const disposer = setup() as (() => void)
           injectionDisposers.push(disposer)
           return disposer
@@ -30,6 +30,10 @@ describe('DSHPilot Client Harness slot seam', () => {
     expect(registrations).toEqual(expect.arrayContaining([
       { name: 'conversation.composer.dock', id: 'dshpilot-status', order: 200, label: 'DSHPilot' },
       { name: 'sidebar.footer.action', id: 'dshpilot-update', order: 50, label: 'DSHPilot Update' },
+      { name: 'settings.section', id: 'dshpilot-remote', order: 50, label: '远程控制' },
+      { name: 'settings.section', id: 'dshpilot-mcp', order: 51, label: 'MCP 管理' },
+      { name: 'settings.section', id: 'dshpilot-tokens', order: 52, label: 'Token 统计' },
+      { name: 'settings.section', id: 'dshpilot-update', order: 53, label: '检查更新' },
     ]))
     for (const disposer of injectionDisposers) disposer()
     expect(registrations).toHaveLength(0)

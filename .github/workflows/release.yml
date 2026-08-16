@@ -63,6 +63,9 @@ jobs:
         shell: bash
         run: |
           node -e "require('fs').writeFileSync('apps/desktop/src-tauri/tauri.release.json', JSON.stringify({version: process.env.GITHUB_REF_NAME.replace(/^v/, ''), bundle: {createUpdaterArtifacts: false, resources: {'../../../runtime/current': 'runtime', '../../../runtime/current.json': 'runtime/current.json'}}}, null, 2))"
+      - name: Compute release version (strip leading v)
+        shell: bash
+        run: echo "VERSION_NO_V=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
       # Build the .app / nsis installer only. We package the macOS disk image ourselves
       # with `hdiutil` (robust on headless runners) instead of relying on create-dmg's
       # mount step, which can hang in CI. No code-signing identity is required; Tauri
@@ -91,7 +94,7 @@ jobs:
                之后即可正常打开，与签名应用无异。
 
             ## 安装（Windows）
-            下载 `DSHPilot_${{ github.ref_name }}_x64-setup.exe` 双击安装；
+            下载 `DSHPilot_${{ env.VERSION_NO_V }}_x64-setup.exe` 双击安装；
             若 SmartScreen 拦截，点「详细信息」→「仍要运行」。
 
             ## 应用内更新
