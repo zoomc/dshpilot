@@ -59,10 +59,28 @@ jobs:
         continue-on-error: true
         shell: bash
         run: DSHPILOT_RUNTIME_ROOT="$PWD/runtime/current/versions/$(node -p "require('./runtime/current.json').runtimeVersion")" pnpm smoke
+      - name: Stage runtime at short path (Windows long-path workaround)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          mkdir -p /r
+          cp -rL runtime/current /r/current
+          cp runtime/current.json /r/current.json
+      - name: Enable Windows long paths
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f || true
       - name: Generate release build config
         shell: bash
         run: |
-          node -e "require('fs').writeFileSync('apps/desktop/src-tauri/tauri.release.json', JSON.stringify({version: process.env.GITHUB_REF_NAME.replace(/^v/, ''), bundle: {createUpdaterArtifacts: false, resources: {'../../../runtime/current': 'runtime', '../../../runtime/current.json': 'runtime/current.json'}}}, null, 2))"
+          node -e '
+            const fs = require("fs");
+            const isWin = process.platform === "win32";
+            const resources = isWin
+              ? { "runtime": "C:/r/current", "runtime/current.json": "C:/r/current.json" }
+              : { "runtime": "../../../runtime/current", "runtime/current.json": "../../../runtime/current.json" };
+            fs.writeFileSync("apps/desktop/src-tauri/tauri.release.json", JSON.stringify({ version: process.env.GITHUB_REF_NAME.replace(/^v/, ""), bundle: { createUpdaterArtifacts: false, resources } }, null, 2));
+          '
       - name: Compute release version (strip leading v)
         shell: bash
         run: echo "VERSION_NO_V=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
