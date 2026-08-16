@@ -1,0 +1,157 @@
+name: Sync Runtime Snapshot
+
+# Tracks the upstream deepseek-ai/deepseek-harness repository and publishes a
+# fresh, unsigned ("UNSIGNED-LOCAL") runtime snapshot whenever upstream moves.
+# The desktop app's "dsh 核心" update channel reads the rolling `runtime`
+# release produced here, so no Tauri/runtime signing secrets are required.
+on:
+  schedule:
+    - cron: '17 4 * * *' # daily, off the top of the hour
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild and republish even if already published'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-runtime
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            runtime_suffix: darwin-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            runtime_suffix: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Resolve upstream harness commit
+        id: upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha=$(gh api repos/deepseek-ai/deepseek-harness/commits?per_page=1 --jq '.[0].sha')
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Upstream deepseek-harness head: $sha"
+
+      - name: Check if already published
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SUFFIX: ${{ matrix.runtime_suffix }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          mkdir -p rt
+          published=""
+          if gh release download runtime -p "current-${SUFFIX}.json" -D rt >/dev/null 2>&1; then
+            published=$(node -e "const fs=require('fs');try{const j=JSON.parse(fs.readFileSync('rt/current-${SUFFIX}.json','utf8'));console.log(j.upstream&&j.upstream.sha||'')}catch(e){console.log('')}")
+          fi
+          echo "published=${published}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ "$published" = "$UPSTREAM_SHA" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump vendored harness to upstream head
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          git -C vendor/deepseek-harness fetch origin
+          git -C vendor/deepseek-harness checkout "${{ steps.upstream.outputs.sha }}"
+
+      - uses: pnpm/action-setup@v4
+        if: steps.check.outputs.skip != 'true'
+        with:
+          version: 11.7.0
+
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.skip != 'true'
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.check.outputs.skip != 'true'
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies
+        if: steps.check.outputs.skip != 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build vendored harness
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        env:
+          CI: true
+        run: |
+          pnpm --dir vendor/deepseek-harness install --frozen-lockfile --ignore-scripts
+          npm --prefix vendor/deepseek-harness run build:lib
+          npm --prefix vendor/deepseek-harness/apps/web run build
+
+      - name: Build DSHPilot packages
+        if: steps.check.outputs.skip != 'true'
+        run: pnpm run build
+
+      # No DSHPILOT_RUNTIME_PRIVATE_KEY => snapshot is published as UNSIGNED-LOCAL,
+      # which the desktop app accepts via runtime_update_from_url(allowUnsignedLocal: true).
+      - name: Bundle unsigned runtime snapshot
+        if: steps.check.outputs.skip != 'true'
+        run: pnpm runtime:bundle -- --output runtime
+
+      - name: Prepare platform manifest
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: cp "runtime/current.json" "runtime/current-${{ matrix.runtime_suffix }}.json"
+
+      - name: Remove stale platform manifest asset
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete-asset runtime "current-${{ matrix.runtime_suffix }}.json" -y || true
+
+      - name: Publish runtime snapshot
+        if: steps.check.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: runtime
+          name: DSHPilot Runtime (rolling)
+          body: |
+            Rolling runtime snapshot built from upstream deepseek-harness commit `${{ steps.upstream.outputs.sha }}`.
+            Produced unsigned (UNSIGNED-LOCAL) for the in-app "dsh 核心" update channel.
+          files: |
+            runtime/*.tar.gz
+            runtime/current-${{ matrix.runtime_suffix }}.json
+          draft: false
+          prerelease: true
+          fail_on_unmatched_files: true
+
+      - name: Summary
+        shell: bash
+        run: |
+          if [ "${{ steps.check.outputs.skip }}" = "true" ]; then
+            echo "::notice::Platform ${{ matrix.runtime_suffix }} already published for ${{ steps.upstream.outputs.sha }}; nothing to do."
+          else
+            echo "::notice::Published runtime snapshot for ${{ steps.upstream.outputs.sha }} (${{ matrix.runtime_suffix }})."
+          fi

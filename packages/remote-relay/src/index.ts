@@ -123,7 +123,10 @@ export class RemoteRelayServer {
         const parsedOrigin = new URL(origin)
         const scheme = (request.socket as import('node:tls').TLSSocket).encrypted ? 'https:' : 'http:'
         const sameOrigin = parsedOrigin.origin === new URL(`${scheme}//${request.headers.host ?? ''}`).origin
-        if (!(this.options.allowedOrigins?.includes(origin) ?? false) && !sameOrigin) { socket.destroy(); return }
+        // An operator may explicitly opt a relay into any-origin browser access
+        // (e.g. a web PWA client) by setting allowedOrigins to include '*'.
+        const origins = this.options.allowedOrigins ?? []
+        if (!origins.includes('*') && !(origins.includes(origin)) && !sameOrigin) { socket.destroy(); return }
       }
       const existing = this.channels.get(channelId)
       if (existing !== undefined && this.channelExpired(existing)) {

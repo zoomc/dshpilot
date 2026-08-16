@@ -193,7 +193,7 @@ export class DeviceRegistry {
   }
   list(): DeviceInfo[] { return this.state.devices.map(({ tokenHash: _tokenHash, refreshHash: _refreshHash, ...device }) => device) }
 
-  createOffer(ttlMs = 120_000, workspaceIds: readonly string[] = []): PairingOffer {
+  createOffer(ttlMs = 120_000, workspaceIds: readonly string[] = [], options: { lanEndpoint?: string; relay?: { url: string; channelId: string; token: string; encryptionKey: string } } = {}): PairingOffer {
     const code = randomBytes(16).toString('hex').toUpperCase()
     const offer: PairingOffer = {
       schemaVersion: 1,
@@ -201,6 +201,8 @@ export class DeviceRegistry {
       serverId: this.state.serverId, publicKey: this.state.publicKey, code, nonce: randomBytes(16).toString('base64url'),
       expiresAt: new Date(Date.now() + ttlMs).toISOString(),
       ...(workspaceIds.length === 0 ? {} : { workspaceIds: [...new Set(workspaceIds)].slice(0, 64) }),
+      ...(options.lanEndpoint === undefined ? {} : { lanEndpoint: options.lanEndpoint }),
+      ...(options.relay === undefined ? {} : { relay: options.relay }),
     }
     this.pending = { ...offer, expiresMs: Date.now() + ttlMs, codeHash: createHash('sha256').update(code).digest('hex') }
     return offer
@@ -330,6 +332,10 @@ export interface ControlPlaneServerOptions {
   workspaceIds?: readonly string[]
   /** Enable the optional opaque WebSocket relay transport. */
   relayEnabled?: boolean
+  /** LAN-scoped HTTP endpoint advertised in pairing offers for direct same-network control. */
+  lanEndpoint?: string
+  /** Relay connection details advertised in pairing offers for cross-network control. */
+  relay?: { url: string; channelId: string; token: string; encryptionKey: string }
   /** Require a client identity proof when pairing from a non-loopback peer. */
   requireDeviceIdentityOnRemotePairing?: boolean
   /** Resource-level authorization seam; returning false is fail-closed. */
@@ -413,6 +419,14 @@ export class ControlPlaneServer {
   }
   address(): { host: string; port: number } | undefined { return this.addressValue }
 
+  /**
+   * Build a pairing offer that already embeds the server's LAN and relay
+   * endpoints, so a scanning client can auto-route (direct LAN, then relay).
+   */
+  offerPairing(ttlMs = 120_000, workspaceIds: readonly string[] = []): PairingOffer {
+    return this.devices.createOffer(ttlMs, workspaceIds, { lanEndpoint: this.options.lanEndpoint, relay: this.options.relay })
+  }
+
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`)
@@ -439,7 +453,7 @@ export class ControlPlaneServer {
       if (url.pathname === '/v1/git/reveal' && request.method === 'POST') { const value = await readJson(request); const cwd = String(value.cwd ?? ''); const path = String(value.path ?? ''); await this.authorizeResource(request, 'control', { operation: 'git_reveal', cwd }); if (this.options.adapter?.gitReveal === undefined) throw new Error('git reveal adapter is not configured'); this.json(response, 200, { ok: true, value: await this.options.adapter.gitReveal(cwd, path) }); return }
       if (url.pathname === '/v1/events' && request.method === 'GET') { const device = await this.authorizeResource(request, 'read', { operation: 'event_list', workspaceId: url.searchParams.get('workspaceId') ?? undefined }); const sessionWorkspace = await this.resolveSessionWorkspaceMap(); const page = this.events.page(Number(url.searchParams.get('after') ?? 0), Number(url.searchParams.get('limit') ?? 500), url.searchParams.get('generation') ?? undefined); page.events = this.filterEventsByWorkspace(page.events, sessionWorkspace, device?.workspaceIds); this.json(response, 200, { ok: true, value: page }); return }
       if (url.pathname === '/v1/events/stream' && request.method === 'GET') { const device = await this.authorizeResource(request, 'read', { operation: 'event_list', workspaceId: url.searchParams.get('workspaceId') ?? undefined }); const sessionWorkspace = await this.resolveSessionWorkspaceMap(); await this.sse(request, response, Number(url.searchParams.get('after') ?? request.headers['last-event-id'] ?? 0), url.searchParams.get('generation') ?? undefined, device?.workspaceIds, sessionWorkspace); return }
-      if (url.pathname === '/v1/pairing/offer' && request.method === 'POST') { this.authorizeLocalOrAdmin(request); this.json(response, 200, { ok: true, value: this.devices.createOffer(120_000, this.options.workspaceIds ?? []) }); return }
+      if (url.pathname === '/v1/pairing/offer' && request.method === 'POST') { this.authorizeLocalOrAdmin(request); this.json(response, 200, { ok: true, value: this.offerPairing(120_000, this.options.workspaceIds ?? []) }); return }
       if (url.pathname === '/v1/pair' && request.method === 'POST') { const local = this.authorizePairRequest(request); const body = await readJson(request); const requestedScopes = Array.isArray(body.scopes) ? body.scopes as ControlScope[] : undefined; const scopes = local && this.options.allowLocalAdminPairing ? requestedScopes : requestedScopes?.filter(scope => scope !== 'admin'); const workspaceIds = Array.isArray(body.workspaceIds) && body.workspaceIds.every(value => typeof value === 'string') ? body.workspaceIds as string[] : undefined; const pairing: DevicePairingRequest = { code: String(body.code ?? ''), name: String(body.name ?? ''), ...(scopes === undefined ? {} : { scopes }), ...(workspaceIds === undefined ? {} : { workspaceIds }), ...(typeof body.offerId === 'string' ? { offerId: body.offerId } : {}), ...(typeof body.serverId === 'string' ? { serverId: body.serverId } : {}), ...(typeof body.serverPublicKey === 'string' ? { serverPublicKey: body.serverPublicKey } : {}), ...(typeof body.identityPublicKey === 'string' ? { identityPublicKey: body.identityPublicKey } : {}), ...(typeof body.pairingProof === 'string' ? { pairingProof: body.pairingProof } : {}) }; const result = await this.devices.pair(pairing, undefined, ['read', 'control'], { requireIdentity: !local && this.options.requireDeviceIdentityOnRemotePairing === true }); this.events.append('device.paired', { deviceId: result.device.deviceId, name: result.device.name }); this.json(response, 200, { ok: true, value: result }); return }
       if (url.pathname === '/v1/token/refresh' && request.method === 'POST') { const body = await readJson(request); const result = await this.devices.refresh(String(body.deviceId ?? ''), String(body.refreshToken ?? '')); this.json(response, 200, { ok: true, value: result }); return }
       if (url.pathname === '/v1/devices' && request.method === 'GET') { this.authorize(request, 'admin'); this.json(response, 200, { ok: true, value: this.devices.list() }); return }

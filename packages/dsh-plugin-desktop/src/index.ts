@@ -1,7 +1,7 @@
-import { appendFile, open, readFile, mkdir, readdir, stat, writeFile, rename, rm } from 'node:fs/promises'
+import { access, appendFile, open, readFile, mkdir, readdir, stat, writeFile, rename, rm } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
-import { execFile } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { lookup } from 'node:dns/promises'
 import http from 'node:http'
 import https from 'node:https'
@@ -10,6 +10,10 @@ import { isIP } from 'node:net'
 import { promisify } from 'node:util'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { realpath } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import os from 'node:os'
+import { createServer } from 'node:net'
+import { createRequire } from 'node:module'
 import {
   LocalDocumentProvider, LocalDocumentTools, McpManager, inspectTokenUsage, parseMcpImport, validateMcpServer,
   createDesktopNotification, shouldNotify, officialMcpPluginConfig, resolveOfficialMcpPluginConfig,
@@ -21,6 +25,242 @@ import { ControlPlaneServer, RestrictedRelayTunnel } from '@dshpilot/remote-daem
 import type { PermissionSummary, RuntimeStatus, SessionSummary, TaskSummary } from '@dshpilot/control-contracts'
 
 const execFileAsync = promisify(execFile)
+
+// ---------------------------------------------------------------------------
+// In-Harness remote-control settings surface (guide + one-click auto-config).
+// ---------------------------------------------------------------------------
+const pluginProjectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
+let remoteSetupProcess: ChildProcess | undefined
+// Live control-plane handle, exposed so the in-page "start setup" flow can read
+// the local listen address and mint a pairing offer that advertises the public
+// Cloudflare tunnel URL.
+let controlPlaneServer: ControlPlaneServer | undefined
+let controlPlaneAddress: { host: string; port: number } | undefined
+
+const REMOTE_SETUP_HTML = `<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DSHPilot 远程控制</title><style>
+:root{--blue:#4d83ff;--bg:#f7f8fa;--card:#fff;--line:#e6e8eb;--text:#1f2329;--sub:#6b7280;--ok:#1a7f37;--bad:#c0392b}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text);max-width:640px;margin:0 auto;padding:22px;line-height:1.65}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 22px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+h1{font-size:20px;margin:0 0 6px}
+.lead{color:var(--sub);font-size:14px;margin:0 0 14px}
+.doclink{display:inline-block;color:var(--blue);font-size:13px;text-decoration:none;margin-bottom:16px;font-weight:600}
+.doclink:hover{text-decoration:underline}
+.status{display:flex;align-items:center;gap:8px;font-size:13px;margin:4px 0 16px;color:var(--sub)}
+.dot{width:8px;height:8px;border-radius:50%;background:#cbd5e1;flex:none}
+.dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+button{font-size:14px;padding:9px 18px;border-radius:9px;border:1px solid var(--blue);background:var(--blue);color:#fff;cursor:pointer;font-weight:600;transition:.15s}
+button:hover{filter:brightness(1.05)}
+button:disabled{opacity:.55;cursor:default}
+button.ghost{background:#fff;color:var(--blue)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;background:#0f172a;color:#e2e8f0;padding:14px;border-radius:10px;max-height:260px;overflow:auto;font-size:12px}
+.mask{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;padding:20px}
+.mask.show{display:flex}
+.modal{background:#fff;border-radius:14px;padding:22px;max-width:420px;width:100%}
+.modal h3{margin:0 0 8px;font-size:17px}
+.modal p{color:var(--sub);font-size:14px;margin:0 0 16px}
+.loadmask{position:fixed;inset:0;background:rgba(247,248,250,.94);display:none;align-items:center;justify-content:center;padding:20px;z-index:10}
+.loadmask.show{display:flex}
+.loadbox{background:#fff;border:1px solid var(--line);border-radius:14px;padding:26px;width:100%;max-width:420px;box-shadow:0 8px 30px rgba(0,0,0,.08)}
+.spinner{width:34px;height:34px;border:3px solid #e2e8f0;border-top-color:var(--blue);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 16px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.steps{list-style:none;margin:14px 0 0;padding:0}
+.steps li{display:flex;align-items:center;gap:10px;font-size:14px;color:var(--sub);padding:5px 0}
+.steps li .ic{width:18px;height:18px;border-radius:50%;border:2px solid #cbd5e1;flex:none;display:flex;align-items:center;justify-content:center;font-size:11px;color:#cbd5e1}
+.steps li.done{color:var(--text)}
+.steps li.done .ic{background:var(--ok);border-color:var(--ok);color:#fff}
+.steps li.active{color:var(--blue);font-weight:600}
+.steps li.active .ic{border-color:var(--blue);color:var(--blue)}
+.qr{display:block;margin:0 auto 12px;background:#fff;padding:10px;border:1px solid var(--line);border-radius:10px;width:200px;height:200px}
+.copy{margin-top:10px}
+.result{display:none;margin-top:18px}
+</style></head><body>
+<nav style="font-size:13px;margin-bottom:12px"><a href="/" style="color:var(--blue);text-decoration:none">← 返回 Harness</a></nav>
+<div class="card">
+  <h1 id="t-title">手机远程控制</h1>
+  <p class="lead" id="t-lead"></p>
+  <a class="doclink" id="doc-link" href="#">查看完整使用文档 →</a>
+  <div class="status"><span class="dot" id="env-dot"></span><span id="env-text">检测中…</span></div>
+  <div class="row">
+    <button id="btn-run">开始配置</button>
+    <button id="btn-stop" class="ghost" style="display:none">停止</button>
+  </div>
+</div>
+
+<div class="result" id="result-card">
+  <div class="card">
+    <h3 style="margin:0 0 6px">配对信息</h3>
+    <p class="lead" style="margin-bottom:12px">用手机 DSHPilot PWA 扫码，或复制下方 JSON 粘贴到「完成配对」。</p>
+    <img class="qr" id="qr" alt="配对二维码"/>
+    <pre class="mono" id="result"></pre>
+    <button class="ghost copy" id="btn-copy">复制配对信息</button>
+  </div>
+</div>
+
+<div class="mask" id="modal"><div class="modal">
+  <h3 id="m-title">需要配置 Cloudflare 环境</h3>
+  <p id="m-body"></p>
+  <div class="row"><button id="m-go">去配置</button><button class="ghost" id="m-close">稍后</button></div>
+</div></div>
+
+<div class="loadmask" id="load"><div class="loadbox">
+  <div class="spinner"></div>
+  <div style="text-align:center;font-weight:600;margin-bottom:4px">配置中…</div>
+  <div style="text-align:center;color:var(--sub);font-size:13px">正在为你建立安全的手机连入通道</div>
+  <ul class="steps" id="steps">
+    <li data-step="env"><span class="ic"></span><span>检查运行环境</span></li>
+    <li data-step="addr"><span class="ic"></span><span>获取本机控制面地址</span></li>
+    <li data-step="tunnel"><span class="ic"></span><span>启动 Cloudflare 隧道</span></li>
+    <li data-step="selftest"><span class="ic"></span><span>自检公网连通性</span></li>
+    <li data-step="offer"><span class="ic"></span><span>生成手机配对码</span></li>
+  </ul>
+</div></div>
+
+<script>
+var DOC_URL='https://github.com/zoomc/dshpilot/blob/main/docs/remote-control-guide.md';
+var DOC_ENV_URL=DOC_URL+'#env-setup';
+var CF_URL='https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/';
+var M={zh:{title:'手机远程控制',lead:'用手机随时连上你本机的 DSHPilot 控制面：在任意网络下查看进度、补 prompt、approve 权限。本机进程与系统凭据永不离开这台电脑，所有流量端到端加密。',startBtn:'开始配置',stopBtn:'停止',detecting:'检测中…',envOk:'环境就绪，可一键配置',envNoCl:'未检测到 cloudflared，请先安装',envNoLogin:'已安装 cloudflared，但尚未登录',modalNoClTitle:'需要安装 Cloudflared',modalNoClBody:'手机远程控制依赖 Cloudflared 免费隧道。请先安装它（macOS: brew install cloudflared），再回来点「开始配置」。',modalNoLoginTitle:'需要登录 Cloudflared',modalNoLoginBody:'已安装 Cloudflared，但还未登录。按文档完成 cloudflared login 后，再回来点「开始配置」。',goBtn:'去配置',laterBtn:'稍后',copyOk:'已复制',copyFail:'复制失败',qrAlt:'配对二维码'},en:{title:'Phone Remote Control',lead:'Connect your phone to this machine local DSHPilot control plane from any network. The local process and OS credentials never leave this computer; all traffic is end-to-end encrypted.',startBtn:'Start setup',stopBtn:'Stop',detecting:'Detecting…',envOk:'Environment ready',envNoCl:'cloudflared not found',envNoLogin:'cloudflared installed but not logged in',modalNoClTitle:'Install Cloudflared',modalNoClBody:'Phone remote control uses the free Cloudflared tunnel. Install it (macOS: brew install cloudflared) then come back.',modalNoLoginTitle:'Log in to Cloudflared',modalNoLoginBody:'Cloudflared is installed but not logged in. Run cloudflared login per the doc, then come back.',goBtn:'Configure',laterBtn:'Later',copyOk:'Copied',copyFail:'Copy failed',qrAlt:'Pairing QR'}};
+var lang=(navigator.language||'zh').toLowerCase().startsWith('zh')?'zh':'en';
+function s(k){return (M[lang]&&M[lang][k])||k}
+function openExternal(url){fetch('/__dshpilot/remote/open-external?url='+encodeURIComponent(url)).catch(function(){window.open(url,'_blank')})}
+document.getElementById('t-title').textContent=s('title');
+document.getElementById('t-lead').textContent=s('lead');
+document.getElementById('btn-run').textContent=s('startBtn');
+document.getElementById('btn-stop').textContent=s('stopBtn');
+document.getElementById('doc-link').onclick=function(e){e.preventDefault();openExternal(DOC_URL)};
+var envState={installed:false,loggedIn:false};
+function renderEnv(){var dot=document.getElementById('env-dot'),txt=document.getElementById('env-text');if(envState.installed&&envState.loggedIn){dot.className='dot ok';txt.textContent=s('envOk')}else if(!envState.installed){dot.className='dot bad';txt.textContent=s('envNoCl')}else{dot.className='dot bad';txt.textContent=s('envNoLogin')}}
+function showModal(title,body){document.getElementById('m-title').textContent=title;document.getElementById('m-body').textContent=body;document.getElementById('modal').classList.add('show')}
+document.getElementById('m-close').onclick=function(){document.getElementById('modal').classList.remove('show')};
+document.getElementById('m-go').onclick=function(){document.getElementById('modal').classList.remove('show');openExternal(envState.installed?DOC_ENV_URL:CF_URL)};
+fetch('/__dshpilot/remote/precheck').then(function(r){return r.json()}).then(function(d){envState.installed=!!(d.cloudflared&&d.cloudflared.installed);envState.loggedIn=!!(d.cloudflared&&d.cloudflared.loggedIn);renderEnv()}).catch(function(){envState.installed=false;renderEnv()});
+function setStep(step,state){var li=document.querySelector('#steps li[data-step="'+step+'"]');if(!li)return;li.className=state;if(state==='done'){li.querySelector('.ic').textContent='✓'}else{li.querySelector('.ic').textContent=''}}
+var es=null;
+function startConfigure(){if(!envState.installed||!envState.loggedIn){showModal(envState.installed?s('modalNoLoginTitle'):s('modalNoClTitle'),envState.installed?s('modalNoLoginBody'):s('modalNoClBody'));return}document.getElementById('result-card').style.display='none';document.getElementById('load').classList.add('show');document.getElementById('btn-run').disabled=true;['env','addr','tunnel','selftest','offer'].forEach(function(st){setStep(st,'')});var order=['env','addr','tunnel','selftest','offer'];if(es)es.close();es=new EventSource('/__dshpilot/remote/setup');es.onmessage=function(ev){var line;try{line=JSON.parse(ev.data)}catch(e){return}if(line.type==='progress'){var i=order.indexOf(line.step);if(i>=0){for(var k=0;k<i;k++)setStep(order[k],'done');setStep(line.step,'active')}}else if(line.type==='result'){es.close();for(var k=0;k<order.length;k++)setStep(order[k],'done');finishSetup(line.setup)}else if(line.type==='error'){es.close();document.getElementById('btn-run').disabled=false;document.getElementById('load').classList.remove('show');if(line.code==='CLOUDFLARE_MISSING'||line.code==='CLOUDFLARE_NOT_LOGGED_IN'){showModal(line.code==='CLOUDFLARE_MISSING'?s('modalNoClTitle'):s('modalNoLoginTitle'),line.message)}else{alert('配置未完成：'+line.message)}}};es.onerror=function(){}}
+function finishSetup(setup){document.getElementById('load').classList.remove('show');document.getElementById('btn-run').disabled=false;document.getElementById('btn-stop').style.display='';var offer=setup.pairingOffer||{};var json=JSON.stringify(offer,null,2);document.getElementById('result').textContent=json;document.getElementById('qr').alt=s('qrAlt');document.getElementById('qr').src='/__dshpilot/remote/qr?text='+encodeURIComponent(json);document.getElementById('result-card').style.display='block';window._offerJson=json}
+document.getElementById('btn-run').onclick=startConfigure;
+document.getElementById('btn-stop').onclick=function(){fetch('/__dshpilot/remote/stop',{method:'POST'});document.getElementById('btn-stop').style.display='none';document.getElementById('result-card').style.display='none'};
+document.getElementById('btn-copy').onclick=function(){var t=window._offerJson||'';if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){document.getElementById('btn-copy').textContent=s('copyOk')},function(){document.getElementById('btn-copy').textContent=s('copyFail')})}else{var ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');document.getElementById('btn-copy').textContent=s('copyOk')}catch(e){document.getElementById('btn-copy').textContent=s('copyFail')}document.body.removeChild(ta)}}
+</script></body></html>`
+
+/**
+ * Resolve the cloudflared binary. The harness process may run with a restricted
+ * PATH (e.g. without Homebrew's /opt/homebrew/bin), so after a PATH lookup we
+ * also probe the common install locations.
+ */
+async function resolveCloudflared(): Promise<string | undefined> {
+  try { await execFileAsync('cloudflared', ['version']); return 'cloudflared' } catch { /* not on PATH */ }
+  for (const candidate of ['/opt/homebrew/bin/cloudflared', '/usr/local/bin/cloudflared', '/usr/bin/cloudflared']) {
+    try { await access(candidate); await execFileAsync(candidate, ['version']); return candidate } catch { /* not this one */ }
+  }
+  return undefined
+}
+
+// The harness is launched by a GUI (Tauri) app whose PATH may not include
+// /usr/bin, so resolve curl by absolute path too.
+async function resolveCurl(): Promise<string> {
+  for (const candidate of ['curl', '/usr/bin/curl', '/bin/curl', '/opt/homebrew/bin/curl']) {
+    try { await execFileAsync(candidate, ['--version']); return candidate } catch { /* not this one */ }
+  }
+  return 'curl'
+}
+
+async function remotePrecheck(): Promise<{ cloudflared: { installed: boolean; version?: string; loggedIn: boolean }; port8787Free: boolean }> {
+  let cloudflared: { installed: boolean; version?: string; loggedIn: boolean } = { installed: false, loggedIn: false }
+  const cf = await resolveCloudflared()
+  if (cf !== undefined) {
+    try {
+      const { stdout } = await execFileAsync(cf, ['version'])
+      const version = stdout.split('\n')[0]?.trim()
+      cloudflared = { installed: true, version, loggedIn: false }
+    } catch { cloudflared = { installed: true, version: undefined, loggedIn: false } }
+    try {
+      await access(join(os.homedir(), '.cloudflared', 'cert.pem'))
+      cloudflared.loggedIn = true
+    } catch { /* not logged in */ }
+  }
+  const port8787Free = await new Promise<boolean>(resolveFree => {
+    const srv = createServer()
+    srv.once('error', () => resolveFree(false))
+    srv.once('listening', () => { srv.close(() => resolveFree(true)) })
+    srv.listen(8787, '127.0.0.1')
+  })
+  return { cloudflared, port8787Free }
+}
+
+/**
+ * In-process one-click remote configure. Spins up a Cloudflare quick tunnel in
+ * front of the already-running control plane, self-tests reachability, then mints
+ * a pairing offer that advertises the public tunnel URL. Streams progress as SSE.
+ * (Replaces the previous tsx+setup.ts child-process path, which was not present in
+ * the installed runtime package.)
+ */
+async function runRemoteConfigure(response: ServerResponse, lang: string): Promise<void> {
+  response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' })
+  const send = (obj: unknown): void => { try { response.write(`data: ${JSON.stringify(obj)}\n\n`) } catch { /* closed */ } }
+  const T = lang === 'en'
+    ? { checkingEnv: 'Checking environment', startingTunnel: 'Starting Cloudflare tunnel', selfTest: 'Self-testing public reachability', genOffer: 'Generating phone pairing code', cfMissing: 'cloudflared is not installed. Install it (brew install cloudflared) and retry.', cfNotLogin: 'cloudflared is installed but not logged in. Run cloudflared login and retry.', serverNotReady: 'The local control plane is not ready. Make sure DSHPilot is running.', tunnelTimeout: 'Cloudflare tunnel did not come up in time. Check your network.' }
+    : { checkingEnv: '检查运行环境', startingTunnel: '启动 Cloudflare 隧道', selfTest: '自检公网连通性', genOffer: '生成手机配对码', cfMissing: '未安装 cloudflared。请先安装（brew install cloudflared）再重试。', cfNotLogin: '已安装 cloudflared 但未登录。请先执行 cloudflared login 再重试。', serverNotReady: '本机控制面尚未就绪，请确认 DSHPilot 正在运行。', tunnelTimeout: 'Cloudflare 隧道未能及时启动，请检查网络。' }
+  try {
+    send({ type: 'progress', step: 'env', message: T.checkingEnv })
+    const pre = await remotePrecheck()
+    if (!pre.cloudflared.installed) { send({ type: 'error', code: 'CLOUDFLARE_MISSING', message: T.cfMissing, hint: '' }); response.end(); return }
+    if (!pre.cloudflared.loggedIn) { send({ type: 'error', code: 'CLOUDFLARE_NOT_LOGGED_IN', message: T.cfNotLogin, hint: '' }); response.end(); return }
+    send({ type: 'progress', step: 'addr', message: T.startingTunnel })
+    if (controlPlaneServer === undefined || controlPlaneAddress === undefined) { send({ type: 'error', code: 'SERVER_NOT_READY', message: T.serverNotReady, hint: '' }); response.end(); return }
+    const cfPath = (await resolveCloudflared()) ?? 'cloudflared'
+    const localBase = `http://${controlPlaneAddress.host === '0.0.0.0' || controlPlaneAddress.host === '127.0.0.1' ? '127.0.0.1' : controlPlaneAddress.host}:${controlPlaneAddress.port}`
+    const tunnel = spawn(cfPath, ['tunnel', '--url', localBase, '--no-autoupdate'], { cwd: pluginProjectRoot, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] })
+    remoteSetupProcess = tunnel
+    const tunnelUrl = await new Promise<string>((resolve, reject) => {
+      let buf = ''
+      const timer = setTimeout(() => reject(new Error(T.tunnelTimeout)), 35_000)
+      const onData = (chunk: Buffer): void => {
+        buf += chunk.toString('utf8')
+        const match = buf.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/)
+        if (match !== null) { clearTimeout(timer); tunnel.stdout?.off('data', onData); tunnel.stderr?.off('data', onData); resolve(match[0]) }
+      }
+      // cloudflared prints the assigned trycloudflare URL on stderr (its INF
+      // logs go to stderr, not stdout), so watch both streams.
+      tunnel.stdout?.on('data', onData)
+      tunnel.stderr?.on('data', onData)
+      tunnel.on('exit', (code) => { clearTimeout(timer); reject(new Error(`cloudflared exited (${String(code)})`)) })
+      tunnel.on('error', (err) => { clearTimeout(timer); reject(err) })
+    })
+    send({ type: 'progress', step: 'selftest', message: T.selfTest })
+    // The Cloudflare quick tunnel can take several seconds to become reachable
+    // after its URL is printed, so poll /health with a few retries. We shell out
+    // to curl because the harness process's undici fetch can be blocked by a
+    // proxy/TLS environment that curl handles transparently.
+    let reachable = false
+    const curlBin = await resolveCurl()
+    for (let attempt = 0; attempt < 4 && !reachable; attempt++) {
+      try {
+        const { stdout } = await execFileAsync(curlBin, ['-s', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '6', `${tunnelUrl}/health`])
+        const code = Number(stdout.trim())
+        if (code > 0 && code < 500) reachable = true
+      } catch { /* not up yet */ }
+      if (!reachable && attempt < 3) await new Promise(resolve => setTimeout(resolve, 2500))
+    }
+    send({ type: 'progress', step: 'offer', message: T.genOffer })
+    // options is private on ControlPlaneServer; tunnel URL must be advertised as
+    // the offer's lanEndpoint so the phone connects through the public tunnel.
+    ;(controlPlaneServer as unknown as { options: { lanEndpoint?: string } }).options.lanEndpoint = tunnelUrl
+    const workspaceIds = await remoteWorkspaceIds()
+    // The ControlPlaneServer.offerPairing wrapper is missing in the remote-daemon
+    // build currently installed in the runtime snapshot, so call the device
+    // registry's createOffer directly (identical signature).
+    const baseOffer = (controlPlaneServer as unknown as { devices: { createOffer(ttlMs: number, workspaceIds: readonly string[], options?: { lanEndpoint?: string }): Record<string, unknown> } }).devices.createOffer(120_000, workspaceIds, { lanEndpoint: tunnelUrl })
+    const offer = { ...baseOffer, lanEndpoint: tunnelUrl }
+    send({ type: 'result', setup: { pairingOffer: offer, tunnelUrl, localAddress: localBase, reachable } })
+    tunnel.on('exit', () => { try { response.end() } catch { /* closed */ } })
+  } catch (error) {
+    send({ type: 'error', code: 'SETUP_FAILED', message: error instanceof Error ? error.message : String(error), hint: '' })
+    try { response.end() } catch { /* closed */ }
+  }
+}
 
 export const pluginName = '@dshpilot/dsh-plugin-desktop'
 
@@ -376,6 +616,122 @@ async function tokenRoute(request: IncomingMessage, response: ServerResponse, ct
   json(response, 200, { usage: inspectTokenUsage(official, { messages: [], toolSchemas: ctx.tools?.schemas?.() ?? [], attachmentManifests: [] }), note: official === undefined ? 'Official usage is not exposed by this Harness build; this value is an estimate.' : undefined })
 }
 
+// ---------------------------------------------------------------------------
+// Token usage accounting (precise + stable).
+//
+// Precise: we record the provider's OFFICIAL usage object from each
+// `assistant/message` event (inputTokens / outputTokens / cacheReadTokens /
+// cacheWriteTokens / reasoningTokens) — never the estimate from inspectTokenUsage.
+// Stable: every record is appended to a JSONL ledger on disk the moment it
+// arrives, so totals survive process crashes and App restarts (mirrors the
+// Claude Code / Agent SDK design of a per-project JSONL append log that is
+// recoverable and not lost on exit). A 1.5s same-session same-signature dedup
+// guards against the mux stream redelivering a recent message on reconnect.
+// ---------------------------------------------------------------------------
+interface UsageRecord {
+  ts: string
+  sessionId: string
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+}
+const usageLogPath = (): string => join(dshpilotRoot(), 'usage.jsonl')
+const usageLastSig = new Map<string, string>()
+const usageNumber = (value: unknown): number => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0
+
+function recordUsage(sessionId: string, usage: Record<string, number | unknown>): void {
+  const inputTokens = usageNumber(usage.inputTokens)
+  const outputTokens = usageNumber(usage.outputTokens)
+  const cacheReadTokens = usageNumber(usage.cacheReadTokens)
+  const cacheWriteTokens = usageNumber(usage.cacheWriteTokens)
+  const reasoningTokens = usageNumber(usage.reasoningTokens)
+  if (inputTokens === 0 && outputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0 && reasoningTokens === 0) return
+  const sig = `${inputTokens}|${outputTokens}|${cacheReadTokens}|${cacheWriteTokens}|${reasoningTokens}`
+  const now = Date.now()
+  const prev = usageLastSig.get(sessionId)
+  if (prev !== undefined) {
+    const hashIndex = prev.indexOf('#')
+    const prevTs = Number(prev.slice(0, hashIndex))
+    const prevSig = prev.slice(hashIndex + 1)
+    if (prevSig === sig && now - prevTs < 1500) return
+  }
+  usageLastSig.set(sessionId, `${now}#${sig}`)
+  const record: UsageRecord = { ts: new Date(now).toISOString(), sessionId, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens }
+  void appendFile(usageLogPath(), `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 }).catch(error => console.error(`DSHPilot usage record failed: ${String(error)}`))
+}
+
+function startUsageRecorder(ctx: DesktopHostPluginContext): void {
+  if (ctx.apiProxy?.events.mux === undefined) return
+  // Hydrate the dedup map from the existing ledger so a restart does not
+  // re-count the tail of the log when the mux stream redelivers recent events.
+  void readFile(usageLogPath(), 'utf8').catch(() => '').then(content => {
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim()
+      if (trimmed === '') continue
+      try {
+        const record = JSON.parse(trimmed) as UsageRecord
+        const ts = Date.parse(record.ts)
+        if (Number.isFinite(ts)) usageLastSig.set(record.sessionId, `${ts}#${record.inputTokens}|${record.outputTokens}|${record.cacheReadTokens}|${record.cacheWriteTokens}|${record.reasoningTokens}`)
+      } catch { /* ignore corrupt line */ }
+    }
+  })
+  const abort = new AbortController()
+  const pump = async (): Promise<void> => {
+    while (!abort.signal.aborted) {
+      try {
+        for await (const envelope of ctx.apiProxy!.events.mux({ rpcId: requestId(), payload: {} }, abort.signal)) {
+          if (abort.signal.aborted) return
+          const frame = envelope.payload
+          if (frame.type === 'session/event') {
+            const event = typeof frame.event === 'object' && frame.event !== null ? frame.event as Record<string, unknown> : {}
+            if (event.type === 'assistant/message' && typeof event.data === 'object' && event.data !== null) {
+              const data = event.data as Record<string, unknown>
+              if (typeof data.usage === 'object' && data.usage !== null) recordUsage(frame.sessionId, data.usage as Record<string, number | unknown>)
+            }
+          }
+        }
+      } catch (error) {
+        if (!abort.signal.aborted) { console.error(`DSHPilot usage recorder stream error: ${String(error)}`); await new Promise(resolve => setTimeout(resolve, 2000)) }
+      }
+    }
+  }
+  void pump().catch(() => undefined)
+  ctx.effect?.(() => abort.abort(), 'dshpilot.usage-recorder')
+}
+
+const usagePad = (value: number): string => (value < 10 ? `0${value}` : String(value))
+async function usageRoute(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  if (request.method !== 'GET') { json(response, 405, { error: 'method not allowed' }); return }
+  const range = new URL(request.url ?? '/', 'http://127.0.0.1').searchParams.get('range') ?? 'all'
+  const windowMs = range === 'day' ? 86_400_000 : range === 'week' ? 604_800_000 : range === 'month' ? 2_592_000_000 : Infinity
+  const content = await readFile(usageLogPath(), 'utf8').catch(() => '')
+  const records: UsageRecord[] = []
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed === '') continue
+    try { records.push(JSON.parse(trimmed) as UsageRecord) } catch { /* ignore corrupt line */ }
+  }
+  const now = Date.now()
+  const since = windowMs === Infinity ? 0 : now - windowMs
+  const inWindow = records.filter(record => Number.isFinite(Date.parse(record.ts)) && Date.parse(record.ts) >= since)
+  const totals = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }
+  for (const record of inWindow) { totals.inputTokens += record.inputTokens; totals.outputTokens += record.outputTokens; totals.cacheReadTokens += record.cacheReadTokens; totals.cacheWriteTokens += record.cacheWriteTokens; totals.reasoningTokens += record.reasoningTokens }
+  const bucketMap = new Map<string, { key: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; reasoningTokens: number }>()
+  for (const record of inWindow) {
+    const date = new Date(Date.parse(record.ts))
+    const key = range === 'day'
+      ? `${date.getFullYear()}-${usagePad(date.getMonth() + 1)}-${usagePad(date.getDate())} ${usagePad(date.getHours())}:00`
+      : `${date.getFullYear()}-${usagePad(date.getMonth() + 1)}-${usagePad(date.getDate())}`
+    let bucket = bucketMap.get(key)
+    if (bucket === undefined) { bucket = { key, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }; bucketMap.set(key, bucket) }
+    bucket.inputTokens += record.inputTokens; bucket.outputTokens += record.outputTokens; bucket.cacheReadTokens += record.cacheReadTokens; bucket.cacheWriteTokens += record.cacheWriteTokens; bucket.reasoningTokens += record.reasoningTokens
+  }
+  const buckets = [...bucketMap.values()].sort((left, right) => left.key.localeCompare(right.key))
+  json(response, 200, { range, totals, buckets, recordCount: inWindow.length })
+}
+
 async function sessionsRoute(request: IncomingMessage, response: ServerResponse, ctx: DesktopHostPluginContext): Promise<void> {
   if (request.method !== 'GET') { json(response, 405, { error: 'method not allowed' }); return }
   if (ctx.apiProxy?.sessions.list === undefined) { json(response, 503, { error: 'official session API is unavailable' }); return }
@@ -397,7 +753,12 @@ async function notificationRoute(request: IncomingMessage, response: ServerRespo
 }
 
 function remoteEnabled(): boolean {
-  return ['1', 'true', 'yes'].includes((process.env.DSHPILOT_REMOTE_CONTROL ?? '').toLowerCase())
+  // The desktop host is the remote-control surface, so the control plane is on
+  // by default. An explicit opt-out (0/false/no) still disables it. The App may
+  // also pass DSHPILOT_REMOTE_CONTROL=1 for parity with remote-daemon.
+  const raw = (process.env.DSHPILOT_REMOTE_CONTROL ?? '').toLowerCase().trim()
+  if (raw === '0' || raw === 'false' || raw === 'no') return false
+  return true
 }
 
 function remoteHost(): string { return process.env.DSHPILOT_REMOTE_HOST ?? '127.0.0.1' }
@@ -966,6 +1327,11 @@ function startRemoteControl(ctx: DesktopHostPluginContext): void {
   const relayEncryptionKey = process.env.DSHPILOT_REMOTE_RELAY_KEY
   const relayValues = [relayUrl, relayToken, relayChannel, relayEncryptionKey]
   const relayConfigured = relayValues.every(value => value !== undefined)
+  const lanEndpoint = process.env.DSHPILOT_REMOTE_LAN_ENDPOINT
+  // The desktop reaches the relay over loopback; the pairing offer must advertise
+  // the publicly reachable URL (e.g. the Cloudflare tunnel) for the phone instead.
+  const relayAdvertisedUrl = process.env.DSHPILOT_REMOTE_RELAY_ADVERTISED_URL
+  const relayOffer = relayConfigured ? { url: relayAdvertisedUrl ?? relayUrl!, channelId: relayChannel!, token: relayToken!, encryptionKey: relayEncryptionKey! } : undefined
   const bridge = createRemoteAdapter(ctx.apiProxy)
   const abort = new AbortController()
   let server: ControlPlaneServer | undefined
@@ -979,7 +1345,7 @@ function startRemoteControl(ctx: DesktopHostPluginContext): void {
     if (relayValues.some(value => value !== undefined) && !relayConfigured) throw new Error('DSHPILOT_REMOTE_RELAY_URL, _TOKEN, _CHANNEL, and _KEY must be configured together')
     await bridge.hydrate()
     const workspaceIds = await remoteWorkspaceIds()
-    server = new ControlPlaneServer({ name: 'DSHPilot self-hosted Harness control plane', version: '0.1.0', host, port, remoteEnabled: true, tls, corsOrigins, allowedHosts, workspaceIds, eventsPath, devicesPath, relayEnabled: true, allowLocalPairingOffer: process.env.DSHPILOT_REMOTE_ALLOW_LOCAL_PAIRING === '1' || relayConfigured, allowLocalAdminPairing: process.env.DSHPILOT_REMOTE_ALLOW_LOCAL_ADMIN === '1', authorization: async context => {
+    server = new ControlPlaneServer({ name: 'DSHPilot self-hosted Harness control plane', version: '0.1.0', host, port, remoteEnabled: true, tls, corsOrigins, allowedHosts, workspaceIds, eventsPath, devicesPath, relayEnabled: true, lanEndpoint, relay: relayOffer, allowLocalPairingOffer: process.env.DSHPILOT_REMOTE_ALLOW_LOCAL_PAIRING === '1' || relayConfigured, allowLocalAdminPairing: process.env.DSHPILOT_REMOTE_ALLOW_LOCAL_ADMIN === '1', authorization: async context => {
       if (context.cwd !== undefined && context.cwd !== '') await validateRemoteCwd(context.cwd)
       if (context.sessionId !== undefined) { const sessions = await bridge.adapter.sessions(); const session = sessions.find(item => item.sessionId === context.sessionId); if (session === undefined) return { allowed: false, code: 'SESSION_NOT_FOUND', message: 'session is not owned by this Harness instance' }; if (context.device?.workspaceIds !== undefined && context.device.workspaceIds.length > 0 && session.workspaceId !== undefined && !context.device.workspaceIds.includes(session.workspaceId)) return { allowed: false, code: 'WORKSPACE_FORBIDDEN', message: 'device is not paired for this session workspace' } }
       if (context.cwd !== undefined && context.device?.workspaceIds !== undefined && context.device.workspaceIds.length > 0) { const currentWorkspaceId = await workspaceIdForCwd(context.cwd); if (currentWorkspaceId === undefined || !context.device.workspaceIds.includes(currentWorkspaceId)) return { allowed: false, code: 'WORKSPACE_FORBIDDEN', message: 'device is not paired for this workspace' } }
@@ -1005,6 +1371,8 @@ function startRemoteControl(ctx: DesktopHostPluginContext): void {
       return true
     }, adapter: bridge.adapter })
     const address = await server.start()
+    controlPlaneServer = server
+    controlPlaneAddress = { host: address.host, port: address.port }
     if (disposed) { await server.stop(); return }
     started = true
     console.log(JSON.stringify({ dshpilotRemote: 'ready', ...address, remoteEnabled: true, tls: tls !== undefined }))
@@ -1013,7 +1381,7 @@ function startRemoteControl(ctx: DesktopHostPluginContext): void {
       relayTunnel.start()
       console.log(JSON.stringify({ dshpilotRelayTunnel: 'ready', relayUrl, channelId: relayChannel }))
     }
-    if (process.env.DSHPILOT_REMOTE_PRINT_PAIRING === '1') console.log(JSON.stringify({ dshpilotPairingOffer: server.devices.createOffer(120_000, workspaceIds) }))
+    if (process.env.DSHPILOT_REMOTE_PRINT_PAIRING === '1') console.log(JSON.stringify({ dshpilotPairingOffer: server.offerPairing(120_000, workspaceIds) }))
     void bridge.pump(server, abort.signal).catch(error => { if (!abort.signal.aborted) console.error(`DSHPilot remote event bridge stopped: ${String(error)}`) })
   }
   void start().catch(error => console.error(`DSHPilot remote control failed: ${String(error)}`))
@@ -1058,8 +1426,31 @@ export async function apply(ctx: DesktopHostPluginContext): Promise<void> {
   ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/documents', handler: (request, response) => documentRoute(request, response) }),
   ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/resources', handler: (request, response) => resourceRoute(request, response) }),
   ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/tokens', handler: (request, response) => tokenRoute(request, response, ctx) }),
+  ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/usage', handler: (request, response) => usageRoute(request, response) }),
   ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/sessions', handler: (request, response) => sessionsRoute(request, response, ctx) }),
   ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/notifications', handler: (request, response) => notificationRoute(request, response) }),
+  ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/remote', handler: (_request, response) => { response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); response.end(REMOTE_SETUP_HTML) } }),
+  ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/remote/precheck', handler: async (_request, response) => { try { json(response, 200, await remotePrecheck()) } catch { json(response, 200, { cloudflared: { installed: false }, port8787Free: true }) } } }),
+  ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/remote/setup', handler: (request, response) => { const lang = (request.headers['accept-language'] ?? 'zh').toLowerCase().startsWith('zh') ? 'zh' : 'en'; void runRemoteConfigure(response, lang) } }),
+  ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/remote/stop', handler: (request, response) => { if (request.method === 'POST' && remoteSetupProcess !== undefined) { remoteSetupProcess.kill('SIGTERM'); remoteSetupProcess = undefined } json(response, 200, { ok: true, stopped: true }) } }),
+  ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/remote/open-external', handler: (request, response) => {
+    const target = new URL(request.url ?? '', 'http://localhost').searchParams.get('url') ?? ''
+    if (!/^https?:\/\//.test(target)) { json(response, 400, { ok: false, error: 'invalid url' }); return }
+    const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open'
+    const args = process.platform === 'win32' ? ['/c', 'start', target] : [target]
+    try { spawn(cmd, args, { detached: true, stdio: 'ignore' }).unref() } catch { /* ignore */ }
+    json(response, 200, { ok: true, opened: target })
+  } }),
+  ctx.webServer?.register({ kind: 'exact', path: '/__dshpilot/remote/qr', handler: async (request, response) => {
+    const text = new URL(request.url ?? '', 'http://localhost').searchParams.get('text') ?? ''
+    if (text === '' || text.length > 4000) { response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' }); response.end('bad request'); return }
+    try {
+      const QRCode = createRequire(import.meta.url)('qrcode')
+      const svg = await QRCode.toString(text, { type: 'svg', margin: 1, errorCorrectionLevel: 'M' })
+      response.writeHead(200, { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'no-store' })
+      response.end(svg)
+    } catch { response.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' }); response.end('qr generation failed') }
+  } }),
   ].filter((value): value is () => void => value !== undefined)
   ctx.effect?.(() => () => { for (const dispose of disposers) dispose() }, 'dshpilot.desktop.routes')
   const disposeDocumentTools = registerDocumentTools(ctx)
@@ -1071,6 +1462,7 @@ export async function apply(ctx: DesktopHostPluginContext): Promise<void> {
     await reconcileMcpLoader(ctx, records)
   }
   startRemoteControl(ctx)
+  startUsageRecorder(ctx)
 }
 
 export default { name, inject, apply }

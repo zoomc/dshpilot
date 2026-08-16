@@ -26,7 +26,7 @@ function harnessRoute(value: string, base: string): string | undefined {
 function defaultRuntimeManifestUrl(): string {
   const windows = /Windows/u.test(navigator.userAgent)
   const suffix = windows ? 'windows-x64' : 'darwin-arm64'
-  return `https://github.com/zoomc/dshpilot/releases/latest/download/current-${suffix}.json`
+  return `https://github.com/zoomc/dshpilot/releases/download/runtime/current-${suffix}.json`
 }
 
 function App() {
@@ -34,8 +34,9 @@ function App() {
   const [updateState, setUpdateState] = useState<AppUpdateState>({ state: 'checking' })
   const [runtimeManifestUrl, setRuntimeManifestUrl] = useState(defaultRuntimeManifestUrl)
   const [runtimeMessage, setRuntimeMessage] = useState<string | undefined>()
-  const navigatedToHarness = useRef<string | undefined>(undefined)
+  const [iframeSrc, setIframeSrc] = useState<string | undefined>(undefined)
   const pendingDeepLinks = useRef<string[]>([])
+  const harnessUrl = status.url
 
   useEffect(() => {
     let cancelled = false
@@ -49,37 +50,40 @@ function App() {
     return () => { cancelled = true; window.clearInterval(timer) }
   }, [])
 
+  // Once Harness is ready, embed it in a full-window iframe so the harness web
+  // UI (including Settings → 插件 with our contributed tabs) renders natively.
+  useEffect(() => {
+    if (status.state === 'ready' && harnessUrl !== undefined && iframeSrc === undefined) {
+      setIframeSrc(harnessUrl)
+    }
+  }, [status.state, harnessUrl, iframeSrc])
+
   useEffect(() => {
     let cancelled = false
     let unlisten: (() => void) | undefined
     void listen<DeepLinkEvent>('dshpilot://open', event => {
       const values = [...(event.payload.urls ?? []), ...(event.payload.argv ?? []).filter(value => value.startsWith('dshpilot:'))]
       if (cancelled) return
-      pendingDeepLinks.current.push(...values)
-      if (status.state === 'ready' && status.url !== undefined) {
-        const next = pendingDeepLinks.current.shift()
-        const route = next === undefined ? undefined : harnessRoute(next, status.url)
-        if (route !== undefined) { navigatedToHarness.current = status.url; window.location.replace(route) }
+      if (status.state === 'ready' && harnessUrl !== undefined) {
+        const next = values[0]
+        const route = next === undefined ? undefined : harnessRoute(next, harnessUrl)
+        if (route !== undefined) setIframeSrc(route)
+      } else {
+        pendingDeepLinks.current.push(...values)
       }
     }).then(value => { if (cancelled) value(); else unlisten = value }).catch(() => undefined)
     return () => { cancelled = true; unlisten?.() }
-  }, [status.state, status.url])
+  }, [status.state, harnessUrl])
 
+  // Flush any deep links that arrived before Harness was ready.
   useEffect(() => {
-    if (status.state !== 'ready' || status.url === undefined || navigatedToHarness.current === status.url) return
+    if (status.state !== 'ready' || harnessUrl === undefined) return
     const pending = pendingDeepLinks.current.shift()
-    const pendingRoute = pending === undefined ? undefined : harnessRoute(pending, status.url)
-    if (pendingRoute !== undefined) { navigatedToHarness.current = status.url; window.location.replace(pendingRoute); return }
-    try {
-      const url = new URL(status.url)
-      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.port === '') return
-      navigatedToHarness.current = status.url
-      window.location.replace(url.toString())
-    } catch { /* keep the recovery screen visible for a malformed readiness value */ }
-  }, [status.state, status.url])
+    const route = pending === undefined ? undefined : harnessRoute(pending, harnessUrl)
+    if (route !== undefined) setIframeSrc(route)
+  }, [status.state, harnessUrl])
 
   const retry = (): void => { void invoke<SupervisorStatus>('supervisor_retry').then(setStatus).catch(error => setStatus({ ...status, state: 'failed', last_error: String(error) })) }
-  const openHarness = (): void => { if (status.url !== undefined) window.location.replace(status.url) }
   const updateRuntime = (): void => {
     setRuntimeMessage('正在下载并验证 Runtime…')
     void invoke<string>('runtime_update_from_url', { manifestUrl: runtimeManifestUrl, allowUnsignedLocal: false })
@@ -96,6 +100,17 @@ function App() {
     if (status.state === 'ready' && !window.confirm('安装应用更新将重启 DSHPilot，进行中的 Harness 会话会中断。确认继续？')) return
     void installAppUpdateSafely(update, setUpdateState).catch(error => setUpdateState({ state: 'failed', error: error instanceof Error ? error.message : String(error) }))
   }
+
+  if (status.state === 'ready' && iframeSrc !== undefined) {
+    // The desktop window is now just the Harness web UI. Feature entries
+    // (远程控制 / MCP 管理 / …) live inside the harness Settings → 插件 panel,
+    // contributed by @dshpilot/dsh-client-desktop, so no separate top menu bar
+    // is needed here.
+    return (
+      <iframe src={iframeSrc} style={{ width: '100%', height: '100%', border: 'none' }} title="Harness" />
+    )
+  }
+
   return <main style={{ fontFamily: 'system-ui', padding: 32 }}>
     <h1>DSHPilot</h1>
     <p>Harness: {status.state} ({status.phase})</p>
@@ -115,7 +130,6 @@ function App() {
       <button type="button" onClick={updateRuntime} disabled={status.state === 'stopping' || status.state === 'starting'}>更新并健康检查</button>
       {runtimeMessage !== undefined && <p style={{ whiteSpace: 'pre-wrap' }}>{runtimeMessage}</p>}
     </section>
-    {status.state === 'ready' && updateState.state !== 'available' && updateState.state !== 'checking' && updateState.state !== 'downloading' && updateState.state !== 'installing' && <button type="button" onClick={openHarness}>打开 Harness</button>}
   </main>
 }
 

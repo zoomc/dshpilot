@@ -90,6 +90,17 @@ export interface DeviceInfo {
   refreshExpiresAt?: string
 }
 
+export interface PairingOfferRelay {
+  /** Relay base URL (e.g. https://relay.example or wss://host). */
+  url: string
+  /** Opaque relay channel id shared by both peers. */
+  channelId: string
+  /** Relay authentication token (HMAC secret). */
+  token: string
+  /** Out-of-band symmetric encryption key guarding relay frames. */
+  encryptionKey: string
+}
+
 export interface PairingOffer {
   schemaVersion: 1
   offerId: string
@@ -99,7 +110,12 @@ export interface PairingOffer {
   nonce: string
   expiresAt: string
   workspaceIds?: readonly string[]
+  /** Deprecated display-only relay base URL; prefer the structured `relay` field. */
   relayEndpoint?: string
+  /** LAN-scoped HTTP endpoint for direct same-network pairing (e.g. http://192.168.1.20:57274). */
+  lanEndpoint?: string
+  /** Present when a blind relay is configured for cross-network pairing. */
+  relay?: PairingOfferRelay
 }
 
 export interface DevicePairingRequest {

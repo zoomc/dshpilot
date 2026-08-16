@@ -26,9 +26,9 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{IsMenuItem, Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, State,
+    AppHandle, Emitter, Manager, State, Wry,
 };
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_notification::NotificationExt;
@@ -645,7 +645,7 @@ fn default_runtime_manifest_url() -> String {
         ("linux", "aarch64") => "linux-arm64",
         _ => "unsupported",
     };
-    format!("https://github.com/zoomc/dshpilot/releases/latest/download/current-{suffix}.json")
+    format!("https://github.com/zoomc/dshpilot/releases/download/runtime/current-{suffix}.json")
 }
 
 fn runtime_manifest_url(value: Option<String>) -> Result<url::Url, String> {
@@ -1065,6 +1065,8 @@ fn spawn_harness(
         .args(args)
         .env("DSH_HOME", dsh_home)
         .env("DSH_TELEMETRY_DISABLED", "1")
+        .env("DSHPILOT_REMOTE_CONTROL", "1")
+        .env("DSHPILOT_REMOTE_ALLOW_LOCAL_PAIRING", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -1869,11 +1871,39 @@ fn keychain_delete(key: String) -> Result<(), String> {
     }
 }
 
+/// Open a URL in the OS default browser. The harness serves the remote-control
+/// settings surface at `<harnessUrl>/__dshpilot/remote`; routing it through the
+/// system browser keeps the in-app Harness session untouched and gives the user
+/// a stable, always-reachable entry point from the tray/App menu.
+fn open_url_in_browser(_app: &AppHandle, url: &str) {
+    let _ = if cfg!(target_os = "macos") {
+        Command::new("open").arg(url).status()
+    } else if cfg!(target_os = "windows") {
+        Command::new("cmd").args(["/C", "start", "", url]).status()
+    } else {
+        Command::new("xdg-open").arg(url).status()
+    };
+}
+
+/// Open a URL in the OS default browser. Used by the desktop feature toolbar so
+/// feature pages (e.g. /__dshpilot/remote) open without tearing down the
+/// embedded Harness webview.
+#[tauri::command]
+fn open_url(app: AppHandle, url: String) {
+    open_url_in_browser(&app, &url);
+}
+
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "Show DSHPilot", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
-    TrayIconBuilder::with_id("dshpilot-tray")
+    let show = MenuItem::with_id(app, "show", "显示 DSHPilot", true, None::<&str>)?;
+    let open_harness = MenuItem::with_id(app, "open-harness", "打开 Harness", true, None::<&str>)?;
+    let remote_settings =
+        MenuItem::with_id(app, "remote-settings", "远程控制设置…", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(
+        app,
+        &[&show, &open_harness, &remote_settings, &quit],
+    )?;
+    let mut builder = TrayIconBuilder::with_id("dshpilot-tray")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
@@ -1882,11 +1912,120 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
                     let _ = window.set_focus();
                 }
             }
+            "open-harness" => {
+                if let Ok(url) =
+                    start_harness(app, &app.state::<HarnessState>(), &app.state::<SupervisorStatusState>())
+                {
+                    open_url_in_browser(app, &url);
+                }
+            }
+            "remote-settings" => {
+                if let Ok(url) =
+                    start_harness(app, &app.state::<HarnessState>(), &app.state::<SupervisorStatusState>())
+                {
+                    let target = format!("{}/__dshpilot/remote", url.trim_end_matches('/'));
+                    open_url_in_browser(app, &target);
+                }
+            }
             "quit" => app.exit(0),
+            "install-app" => {
+                let url = {
+                    let state = app.state::<update_check::UpdateState>();
+                    let x = state
+                        .app
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|c| c.asset_url.clone());
+                    x
+                };
+                if let Some(url) = url {
+                    let _ = update_check::install_app_update(app.clone(), url);
+                }
+            }
+            "install-core" => {
+                let _ = runtime_update_from_url(
+                    app.clone(),
+                    app.state::<HarnessState>(),
+                    app.state::<SupervisorStatusState>(),
+                    update_check::runtime_manifest_url(),
+                    Some(true),
+                );
+            }
             _ => {}
-        })
-        .build(app)?;
+        });
+    // Without an icon the macOS tray is invisible, so the menu entry would be
+    // unreachable. Fall back to the app icon when one is configured.
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+    builder.build(app)?;
     Ok(())
+}
+
+/// Runs both update checks, stores the result, refreshes the tray menu and
+/// notifies the frontend. Safe to call from the startup thread.
+fn run_update_checks(app: AppHandle) {
+    let app_check = update_check::check_app_update();
+    let core_check = update_check::check_dsh_core_update(app.clone());
+    {
+        let state = app.state::<update_check::UpdateState>();
+        *state.app.lock().unwrap() = Some(app_check.clone());
+        *state.core.lock().unwrap() = Some(core_check.clone());
+    }
+    let _ = app.emit(
+        "update-status",
+        serde_json::json!({ "app": app_check, "core": core_check }),
+    );
+    rebuild_update_tray(&app, &app_check, &core_check);
+}
+
+/// Rebuilds the tray menu, injecting "install" entries when updates are ready.
+fn rebuild_update_tray(
+    app: &AppHandle,
+    app_check: &update_check::AppUpdateCheck,
+    core_check: &update_check::DshCoreUpdateCheck,
+) {
+    let show = match MenuItem::with_id(app, "show", "显示 DSHPilot", true, None::<&str>) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let open_harness = match MenuItem::with_id(app, "open-harness", "打开 Harness", true, None::<&str>) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let remote_settings = match MenuItem::with_id(app, "remote-settings", "远程控制设置…", true, None::<&str>) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let mut items: Vec<MenuItem<Wry>> = vec![show, open_harness, remote_settings];
+    if app_check.available {
+        if let Ok(item) = MenuItem::with_id(
+            app,
+            "install-app",
+            format!("安装 App 更新 ({})", app_check.latest_version),
+            true,
+            None::<&str>,
+        ) {
+            items.push(item);
+        }
+    }
+    if core_check.available && core_check.ready {
+        if let Ok(item) = MenuItem::with_id(app, "install-core", "更新 dsh 核心", true, None::<&str>) {
+            items.push(item);
+        }
+    }
+    let quit = match MenuItem::with_id(app, "quit", "退出", true, None::<&str>) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    items.push(quit);
+    let refs: Vec<&dyn IsMenuItem<Wry>> = items.iter().map(|i| i as &dyn IsMenuItem<Wry>).collect();
+    if let Ok(menu) = Menu::with_items(app, &refs) {
+        if let Some(tray) = app.tray_by_id("dshpilot-tray") {
+            let _ = tray.set_menu(Some(menu));
+        }
+    }
 }
 
 fn emit_deep_links(app: &tauri::AppHandle, urls: Vec<url::Url>) {
@@ -2011,6 +2150,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(HarnessState::default())
         .manage(SupervisorStatusState::default())
+        .manage(update_check::UpdateState::default())
         .invoke_handler(tauri::generate_handler![
             harness_url,
             ensure_harness,
@@ -2026,10 +2166,21 @@ pub fn run() {
             native_notification,
             keychain_get,
             keychain_set,
-            keychain_delete
+            keychain_delete,
+            open_url,
+            update_check::check_app_update,
+            update_check::check_dsh_core_update,
+            update_check::install_app_update
         ])
         .setup(|app| {
             setup_tray(app)?;
+            {
+                let update_handle = app.handle().clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_secs(12));
+                    run_update_checks(update_handle);
+                });
+            }
             let handle = app.handle().clone();
             let deep_link_handle = handle.clone();
             app.deep_link()
@@ -2072,6 +2223,8 @@ pub fn run() {
             }
         });
 }
+
+mod update_check;
 
 #[cfg(test)]
 mod tests {
