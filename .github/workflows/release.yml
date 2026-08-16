@@ -18,7 +18,7 @@ jobs:
             target: aarch64-apple-darwin
             runtime_suffix: darwin-arm64
             bundles: app
-            pkg_glob: "DSHPilot_*.dmg"
+            pkg_glob: "DSHPilot_*.zip"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             runtime_suffix: windows-x64
@@ -89,19 +89,47 @@ jobs:
       - name: Compute release version (strip leading v)
         shell: bash
         run: echo "VERSION_NO_V=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-      # Build the .app / nsis installer only. We package the macOS disk image ourselves
-      # with `hdiutil` (robust on headless runners) instead of relying on create-dmg's
-      # mount step, which can hang in CI. No code-signing identity is required; Tauri
-      # produces an ad-hoc signed app that runs fine (Gatekeeper prompts on first launch).
+      # Build the .app / nsis installer only.
+      # No code-signing identity is required; Tauri produces an ad-hoc signed app that
+      # runs fine (Gatekeeper prompts on first launch, see release body).
       - name: Build app bundle
         run: pnpm tauri build --bundles ${{ matrix.bundles }}
-      - name: Package macOS disk image
+      # Free disk space before packaging the (large, runtime-bundled) .app so the archive
+      # step has room to write. Debug artifacts and cargo cache are not needed past this point.
+      - name: Free disk space before packaging (macOS)
         if: matrix.os == 'macos-14'
         shell: bash
         run: |
-          APP="apps/desktop/src-tauri/target/release/bundle/macos/DSHPilot.app"
-          OUT="apps/desktop/src-tauri/target/release/bundle/DSHPilot_${{ github.ref_name }}_aarch64.dmg"
-          hdiutil create -srcfolder "$APP" -volname DSHPilot -format UDZO "$OUT"
+          rm -rf apps/desktop/src-tauri/target/debug || true
+          rm -rf "$HOME/.cargo/registry" || true
+      # Package the macOS app as a .zip. We deliberately avoid `hdiutil create -srcfolder`:
+      # it performs a block-level shadow copy that demands exclusive file access and fails
+      # with "Resource busy" when any file inside the (runtime-bundled) .app is still held
+      # by a lingering process. `zip -r -y` reads files individually and tolerates that,
+      # and is functionally equivalent for the user (unzip -> drag to Applications).
+      - name: Package macOS archive
+        if: matrix.os == 'macos-14'
+        shell: bash
+        run: |
+          APP_DIR="apps/desktop/src-tauri/target/release/bundle/macos"
+          OUT="apps/desktop/src-tauri/target/release/bundle/DSHPilot_${{ github.ref_name }}_aarch64.zip"
+          cd "$APP_DIR"
+          zip -r -y "$OUT" "DSHPilot.app"
+      # Remove a stale macOS .dmg asset from a previous run so the release only carries
+      # the current .zip (keeps the asset list unambiguous). Best-effort.
+      - name: Prune stale macOS dmg asset
+        if: matrix.os == 'macos-14'
+        shell: bash
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          ASSET_ID=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" -q ".assets[] | select(.name == \"DSHPilot_${TAG}_aarch64.dmg\") | .id" 2>/dev/null)
+          if [ -n "$ASSET_ID" ]; then
+            gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$ASSET_ID"
+            echo "pruned stale dmg asset"
+          fi
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
@@ -109,8 +137,8 @@ jobs:
           name: DSHPilot ${{ github.ref_name }}
           body: |
             ## 安装（macOS · Apple 芯片）
-            1. 下载 `DSHPilot_${{ github.ref_name }}_aarch64.dmg`。
-            2. 双击挂载，把 DSHPilot 拖到「应用程序」。
+            1. 下载 `DSHPilot_${{ github.ref_name }}_aarch64.zip`。
+            2. 双击解压，把 `DSHPilot.app` 拖到「应用程序」。
             3. 首次打开若提示「无法验证开发者」：
                - 右键 `DSHPilot.app` → 「打开」；或
                - 终端执行 `sudo xattr -dr com.apple.quarantine /Applications/DSHPilot.app`
