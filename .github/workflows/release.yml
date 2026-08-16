@@ -63,9 +63,9 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
-          mkdir -p /r
-          cp -rL runtime/current /r/current
-          cp runtime/current.json /r/current.json
+          mkdir -p D:/rt
+          cp -rL runtime/current D:/rt/current
+          cp runtime/current.json D:/rt/current.json
       - name: Enable Windows long paths
         if: matrix.os == 'windows-latest'
         shell: bash
@@ -77,8 +77,8 @@ jobs:
             const fs = require("fs");
             const isWin = process.platform === "win32";
             const resources = isWin
-              ? { "runtime": "C:/r/current", "runtime/current.json": "C:/r/current.json" }
-              : { "runtime": "../../../runtime/current", "runtime/current.json": "../../../runtime/current.json" };
+              ? { "D:/rt/current": "runtime", "D:/rt/current.json": "runtime/current.json" }
+              : { "../../../runtime/current": "runtime", "../../../runtime/current.json": "runtime/current.json" };
             fs.writeFileSync("apps/desktop/src-tauri/tauri.release.json", JSON.stringify({ version: process.env.GITHUB_REF_NAME.replace(/^v/, ""), bundle: { createUpdaterArtifacts: false, resources } }, null, 2));
           '
       - name: Compute release version (strip leading v)
