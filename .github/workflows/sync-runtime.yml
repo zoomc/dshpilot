@@ -5,8 +5,6 @@ name: Sync Runtime Snapshot
 # The desktop app's "dsh 核心" update channel reads the rolling `runtime`
 # release produced here, so no Tauri/runtime signing secrets are required.
 on:
-  schedule:
-    - cron: '17 4 * * *' # daily, off the top of the hour
   workflow_dispatch:
     inputs:
       force:
